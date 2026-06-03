@@ -143,9 +143,9 @@ describe('SqliteMemoryStore', () => {
       // Update memory to version 2
       await store.update(memory.id, { content: 'First update' });
 
-      // Now attempt update with stale version (1) using the version-aware method
+      // Now attempt update with stale version (1) using the internal version-aware method
       await expect(
-        store.updateWithVersion(memory.id, { content: 'Stale update' }, 1),
+        (store as any).updateWithVersion(memory.id, { content: 'Stale update' }, 1),
       ).rejects.toThrow(ConcurrentUpdateError);
     });
   });
@@ -241,8 +241,8 @@ describe('SqliteMemoryStore', () => {
       // Store a memory
       await store.store({ content: 'Old memory to prune', category: 'other', tags: [] });
 
-      // Prune with impossibly high minStrength so everything gets pruned
-      const result = await store.prune({ dryRun: false, minStrength: 1.0 });
+      // Prune with minStrength > 1.0 so everything (max strength = 1.0) gets pruned
+      const result = await store.prune({ dryRun: false, minStrength: 1.1 });
       expect(result.pruned).toBeGreaterThan(0);
 
       const stats = await store.stats();
@@ -270,6 +270,31 @@ describe('SqliteMemoryStore', () => {
 
     it('throws MemoryNotFoundError when id not found', async () => {
       await expect(store.findRelated('nonexistent-id', 5)).rejects.toThrow(MemoryNotFoundError);
+    });
+  });
+
+  // ── touchAccessed() ───────────────────────────────────────────────
+
+  describe('touchAccessed()', () => {
+    it('increments access_count reflected in stats', async () => {
+      await store.store({ id: 'ta1', content: 'touch test unique99', category: 'learning', tags: [] } as any);
+
+      // Before any manual touch: memory was just stored with access_count = 0
+      const statsBefore = await store.stats();
+      expect(statsBefore.neverAccessed).toBe(1);
+
+      // Call touchAccessed twice manually
+      store.touchAccessed('ta1');
+      store.touchAccessed('ta1');
+
+      // mostAccessed should reflect at least 2 accesses (neverAccessed should now be 0)
+      const statsAfter = await store.stats();
+      expect(statsAfter.neverAccessed).toBe(0);
+      expect(statsAfter.mostAccessed[0].count).toBeGreaterThanOrEqual(2);
+    });
+
+    it('does not throw for missing id', () => {
+      expect(() => store.touchAccessed('nonexistent')).not.toThrow();
     });
   });
 

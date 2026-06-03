@@ -214,9 +214,60 @@ export class SqliteMemoryStore implements MemoryStore {
     };
   }
 
-  async storeBatch(requests: StoreRequest[]): Promise<Memory[]> {
-    if (requests.length === 0) return [];
-    return Promise.all(requests.map(r => this.store(r)));
+  async storeBatch(memories: StoreRequest[]): Promise<Memory[]> {
+    if (memories.length === 0) return [];
+
+    // 1. Embed all memories first (async, before transaction)
+    const embedded = await Promise.all(
+      memories.map(async m => ({ m, vec: await this.embedder.embed(m.content) }))
+    );
+
+    // 2. Write all in one transaction (synchronous db calls)
+    const now = new Date().toISOString();
+    const results: Memory[] = [];
+
+    this.db.exec('BEGIN');
+    try {
+      for (const { m, vec } of embedded) {
+        const id = (m as any).id ?? randomUUID();
+        const tags = JSON.stringify(m.tags ?? []);
+
+        this.db.prepare(
+          `INSERT OR REPLACE INTO memories
+            (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(id, m.content, m.category, tags, now, now, 0, now, 1);
+
+        this.db.prepare(
+          `INSERT OR REPLACE INTO memory_embeddings (id, embedding) VALUES (?, ?)`,
+        ).run(id, embeddingToBlob(vec));
+
+        results.push({
+          id,
+          content: m.content,
+          category: m.category,
+          tags: m.tags ?? [],
+          createdAt: now,
+          updatedAt: now,
+          version: 1,
+        });
+      }
+      this.db.exec('COMMIT');
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+
+    return results;
+  }
+
+  // ── Access tracking ──────────────────────────────────────────────
+
+  touchAccessed(id: string): void {
+    // best-effort: no error if id doesn't exist
+    this.db.prepare(
+      'UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?',
+    ).run(new Date().toISOString(), id);
   }
 
   // ── Search ────────────────────────────────────────────────────────
@@ -357,13 +408,20 @@ export class SqliteMemoryStore implements MemoryStore {
       });
     }
 
-    return filtered
+    const results = filtered
       .map(r => ({
         memory: rowToMemory(r),
         score: applyDecay(r, scoreFor(r)),
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
+
+    // Track access (best-effort)
+    for (const { memory } of results) {
+      this.touchAccessed(memory.id);
+    }
+
+    return results;
   }
 
   // ── findRelated() ─────────────────────────────────────────────────
@@ -416,7 +474,7 @@ export class SqliteMemoryStore implements MemoryStore {
    * Update with an explicit expected version for OCC. Throws ConcurrentUpdateError
    * if the current version does not match expectedVersion.
    */
-  async updateWithVersion(
+  private async updateWithVersion(
     id: string,
     updates: UpdateRequest,
     expectedVersion: number,
