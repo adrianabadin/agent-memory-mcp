@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MCP (Model Context Protocol) server for a memory system backed by LanceDB with hybrid BM25 + vector search. Exposes 8 tools (store, store_batch, search, recall, find_related, list_recent, update, stats) over stdio transport. Uses Xenova/all-MiniLM-L6-v2 embeddings (384 dimensions) via Hugging Face transformers.
+MCP (Model Context Protocol) server for a memory system backed by SQLite (WAL mode) with hybrid FTS5 BM25 + cosine vector search. Exposes 8 tools (store, store_batch, search, recall, find_related, list_recent, update, stats) over stdio transport. Uses Xenova/bge-m3 embeddings (1024 dimensions) via Hugging Face transformers.
 
 ## Commands
 
@@ -18,22 +18,27 @@ MCP (Model Context Protocol) server for a memory system backed by LanceDB with h
 
 ## Environment Variables
 
-- `MEMORY_DB_PATH` (required) — LanceDB database path on disk
-- `EMBEDDING_MODEL` (optional) — HuggingFace model ID, defaults to `Xenova/all-MiniLM-L6-v2`
+- `MEMORY_DB_PATH` (required) — SQLite database path on disk (e.g., path/to/memory.db)
+- `EMBEDDING_MODEL` (optional) — HuggingFace model ID, defaults to `Xenova/bge-m3`
+- `EMBEDDING_DIMENSIONS` (optional) — override vector dimensions if needed for a custom model
+- `EMBEDDING_POOLING` (optional) — override pooling mode (`cls` for BGE models, `mean` for MiniLM-style models)
 - `MEMORY_DECAY_HALF_LIFE` (optional) — temporal decay half-life in days, defaults to `30`. Set to `0` to disable decay
 - `ENABLE_HARDCOPY` — set to `'true'` to enable JSON file backup
 - `HARDCOPY_PATH` (required if hardcopy enabled) — directory for JSON mirror files
+- `EMBEDDING_CACHE_PATH` (optional) — directory for content-addressed binary embedding cache. Speeds up re-runs significantly by skipping ONNX inference for previously-seen text. Cache is invalidated automatically when `EMBEDDING_MODEL` changes.
 
 ## Architecture
 
 **Composition chain** (wired in `src/index.ts`):
 ```
-Embedder → MemoryStore → [HardcopyMemoryStore] → MCP Server → stdio transport
+Embedder → SqliteMemoryStore (default) or LanceMemoryStore (migration source) → [HardcopyMemoryStore] → MCP Server → stdio transport
 ```
 
 **Key interfaces** (`src/types.ts`): `Embedder`, `MemoryStore`, `SearchFilters`, `Memory`, `SearchResult`. All components code against these interfaces, enabling mock-based unit testing.
 
-**LanceMemoryStore** (`src/memory-store.ts`): The main storage layer. Uses LanceDB with a fixed 7-column schema (id, content, category, tags as JSON string, created_at, updated_at, vector). Search uses over-fetching (3× limit) with post-filtering. Category/date filters are SQL WHERE clauses; tag filtering is done in-memory after search. Updates use delete-then-re-add (LanceDB limitation). Hybrid search combines BM25 FTS + cosine vector via RRF reranking, with graceful fallback to semantic-only if FTS index is unavailable. Search results have exponential temporal decay applied (configurable half-life, default 30 days) so recent memories score higher. Memories tagged `evergreen` or `never-forget` are exempt from decay. Results are re-sorted by decayed score before returning.
+**SqliteMemoryStore** (`src/sqlite-store.ts`): The main storage layer. Uses SQLite (WAL mode) with a split-table layout (`memories` for metadata/FTS, `memory_embeddings` for vectors). Stores vectors in a BLOB table using IEEE 754 float32 arrays and performs in-process cosine distance calculations. Key features include: FTS5 virtual tables (`memories_fts`) with triggers for keyword indexing; hybrid search combining FTS5 BM25 keyword scoring and cosine vector distance using Reciprocal Rank Fusion (RRF); exponential temporal decay applied to scores (exempting `evergreen` or `never-forget` tagged memories); access tracking (`access_count` and `last_accessed_at`) with spaced-repetition access intervals; and optimistic concurrency control (`version` increment and check).
+
+**LanceMemoryStore** (`src/memory-store.ts`): Read-only migration source for importing legacy LanceDB databases. It is not used for active writes.
 
 **HardcopyMemoryStore** (`src/hardcopy-store.ts`): Decorator pattern — wraps any MemoryStore and mirrors mutations to `{id}.json` files on disk. Write-only (reads delegate to inner store). Errors are logged to stderr but never propagate.
 
@@ -41,7 +46,12 @@ Embedder → MemoryStore → [HardcopyMemoryStore] → MCP Server → stdio tran
 
 ## Testing
 
-Four test files in `tests/`:
+Test files in `tests/`:
+- `sqlite-store.test.ts` — unit and integration tests for SqliteMemoryStore
+- `migrate.test.ts` — tests migration from LanceDB to SQLite
+- `concurrent-update.test.ts` — tests concurrency and version conflicts on SQLite updates
+- `embedding-cache.test.ts` — tests the embedding cache mechanism
+- `version.test.ts` — checks version constraints and metadata
 - `tools.test.ts` — unit tests for all tool handlers using mocks from `tests/mocks.ts`
 - `integration.test.ts` — tests LanceMemoryStore with real LanceDB on a temp directory (includes temporal decay integration tests)
 - `hardcopy.test.ts` — tests the hardcopy decorator file operations
