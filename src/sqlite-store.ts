@@ -145,8 +145,13 @@ function isEvergreen(row: MemoryRow): boolean {
 }
 
 function escapeFtsQuery(query: string): string {
-  // Wrap in double-quotes to treat as a phrase / avoid FTS5 syntax errors
-  return `"${query.replace(/"/g, '""')}"`;
+  // Quote each token independently so multi-word queries match any token (any order)
+  return query
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(t => `"${t.replace(/"/g, '""')}"`)
+    .join(' ');
 }
 
 const DECAY_HALF_LIFE_DAYS = parseDecayHalfLife(process.env.MEMORY_DECAY_HALF_LIFE);
@@ -188,9 +193,14 @@ export class SqliteMemoryStore implements MemoryStore {
     this.db.exec('BEGIN');
     try {
       this.db.prepare(
-        `INSERT OR REPLACE INTO memories
+        `INSERT INTO memories
           (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           content        = excluded.content,
+           category       = excluded.category,
+           tags           = excluded.tags,
+           updated_at     = excluded.updated_at`,
       ).run(id, request.content, request.category, tags, now, now, 0, now, 1);
 
       this.db.prepare(
@@ -233,9 +243,14 @@ export class SqliteMemoryStore implements MemoryStore {
         const tags = JSON.stringify(m.tags ?? []);
 
         this.db.prepare(
-          `INSERT OR REPLACE INTO memories
+          `INSERT INTO memories
             (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             content        = excluded.content,
+             category       = excluded.category,
+             tags           = excluded.tags,
+             updated_at     = excluded.updated_at`,
         ).run(id, m.content, m.category, tags, now, now, 0, now, 1);
 
         this.db.prepare(
@@ -293,6 +308,7 @@ export class SqliteMemoryStore implements MemoryStore {
     query: string,
     filters: SearchFilters,
     limit: number,
+    trackAccess: boolean = true,
   ): SearchResult[] {
     if (!query.trim()) return [];
 
@@ -309,7 +325,7 @@ export class SqliteMemoryStore implements MemoryStore {
         LIMIT ?
       `).all(escaped, limit * 3) as (MemoryRow & { fts_score: number })[];
 
-      return this.applyFiltersAndDecay(rows, filters, (r) => r.fts_score ?? 1, limit);
+      return this.applyFiltersAndDecay(rows, filters, (r) => r.fts_score ?? 1, limit, trackAccess);
     } catch {
       return [];
     }
@@ -319,9 +335,10 @@ export class SqliteMemoryStore implements MemoryStore {
     query: string,
     filters: SearchFilters,
     limit: number,
+    trackAccess: boolean = true,
   ): Promise<SearchResult[]> {
     const queryVec = await this.embedder.embed(query);
-    return this.vectorSearch(queryVec, filters, limit, null);
+    return this.vectorSearch(queryVec, filters, limit, null, trackAccess);
   }
 
   private vectorSearch(
@@ -329,6 +346,7 @@ export class SqliteMemoryStore implements MemoryStore {
     filters: SearchFilters,
     limit: number,
     excludeId: string | null,
+    trackAccess: boolean = true,
   ): SearchResult[] {
     // Fetch all embeddings + row data and compute cosine in-process
     const rows = this.db.prepare(
@@ -345,14 +363,14 @@ export class SqliteMemoryStore implements MemoryStore {
       }))
       .sort((a, b) => b.rawScore - a.rawScore);
 
+    // Build scoreMap once (O(N)) before calling applyFiltersAndDecay
+    const scoreMap = new Map(scored.map(s => [s.row.id, s.rawScore]));
     return this.applyFiltersAndDecay(
       scored.map(s => s.row),
       filters,
-      (r) => {
-        const s = scored.find(sc => sc.row.id === r.id);
-        return s ? s.rawScore : 0;
-      },
+      (r) => scoreMap.get(r.id) ?? 0,
       limit,
+      trackAccess,
     );
   }
 
@@ -361,14 +379,15 @@ export class SqliteMemoryStore implements MemoryStore {
     filters: SearchFilters,
     limit: number,
   ): Promise<SearchResult[]> {
+    // Pass trackAccess=false to avoid double-incrementing access_count
     const [keywordResults, semanticResults] = await Promise.all([
-      Promise.resolve(this.keywordSearch(query, filters, limit)),
-      this.semanticSearch(query, filters, limit),
+      Promise.resolve(this.keywordSearch(query, filters, limit * 2, false)),
+      this.semanticSearch(query, filters, limit * 2, false),
     ]);
 
-    if (keywordResults.length === 0) return semanticResults;
-    if (semanticResults.length === 0) return keywordResults;
+    if (keywordResults.length === 0 && semanticResults.length === 0) return [];
 
+    // Build merged result set via RRF
     const kwList = keywordResults.map(r => ({ id: r.memory.id, score: r.score }));
     const semList = semanticResults.map(r => ({ id: r.memory.id, score: r.score }));
 
@@ -378,10 +397,26 @@ export class SqliteMemoryStore implements MemoryStore {
       idToMemory.set(r.memory.id, r.memory);
     }
 
-    return merged
+    const finalResults = merged
       .slice(0, limit)
       .filter(({ id }) => idToMemory.has(id))
       .map(({ id, score }) => ({ memory: idToMemory.get(id)!, score }));
+
+    // Touch access exactly once per final result
+    for (const { memory } of finalResults) {
+      this.touchAccessed(memory.id);
+    }
+
+    // Fallback: if one list was empty, fall back to the other (already tracked above)
+    if (finalResults.length === 0) {
+      const fallback = keywordResults.length > 0 ? keywordResults : semanticResults;
+      for (const { memory } of fallback.slice(0, limit)) {
+        this.touchAccessed(memory.id);
+      }
+      return fallback.slice(0, limit);
+    }
+
+    return finalResults;
   }
 
   private applyFiltersAndDecay(
@@ -389,6 +424,7 @@ export class SqliteMemoryStore implements MemoryStore {
     filters: SearchFilters,
     scoreFor: (r: MemoryRow) => number,
     limit: number,
+    trackAccess: boolean = true,
   ): SearchResult[] {
     let filtered = rows;
 
@@ -416,9 +452,11 @@ export class SqliteMemoryStore implements MemoryStore {
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
 
-    // Track access (best-effort)
-    for (const { memory } of results) {
-      this.touchAccessed(memory.id);
+    // Track access (best-effort); skip when caller handles it (e.g. hybridSearch)
+    if (trackAccess) {
+      for (const { memory } of results) {
+        this.touchAccessed(memory.id);
+      }
     }
 
     return results;
@@ -462,19 +500,19 @@ export class SqliteMemoryStore implements MemoryStore {
    */
   async update(id: string, updates: UpdateRequest): Promise<Memory> {
     const existing = this.db.prepare(
-      `SELECT * FROM memories WHERE id = ?`,
-    ).get(id) as MemoryRow | undefined;
+      'SELECT version FROM memories WHERE id = ?',
+    ).get(id) as { version: number } | undefined;
 
     if (!existing) throw new MemoryNotFoundError(id);
 
-    return this.updateWithVersion(id, updates, existing.version);
+    return this._updateWithVersion(id, updates, existing.version);
   }
 
   /**
    * Update with an explicit expected version for OCC. Throws ConcurrentUpdateError
    * if the current version does not match expectedVersion.
    */
-  private async updateWithVersion(
+  private async _updateWithVersion(
     id: string,
     updates: UpdateRequest,
     expectedVersion: number,
@@ -506,8 +544,8 @@ export class SqliteMemoryStore implements MemoryStore {
       throw new ConcurrentUpdateError(id, expectedVersion, current.version);
     }
 
-    // Re-embed if content changed
-    if (updates.content) {
+    // Re-embed if content changed (use !== undefined to handle empty string content)
+    if (updates.content !== undefined) {
       const embedding = await this.embedder.embed(newContent);
       this.db.prepare(
         `INSERT OR REPLACE INTO memory_embeddings (id, embedding) VALUES (?, ?)`,

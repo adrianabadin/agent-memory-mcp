@@ -107,7 +107,7 @@ describe('SqliteMemoryStore', () => {
         { content: 'fox three', category: 'other', tags: [] },
       ]);
       const results = await store.search('fox', 'keyword', { limit: 2 });
-      expect(results.length).toBeLessThanOrEqual(2);
+      expect(results.length).toBe(2);
     });
   });
 
@@ -133,7 +133,7 @@ describe('SqliteMemoryStore', () => {
       ).rejects.toThrow(MemoryNotFoundError);
     });
 
-    it('throws ConcurrentUpdateError when version mismatch via updateWithVersion', async () => {
+    it('throws ConcurrentUpdateError when version mismatch detected', async () => {
       const memory = await store.store({
         content: 'Concurrent content',
         category: 'learning',
@@ -143,9 +143,9 @@ describe('SqliteMemoryStore', () => {
       // Update memory to version 2
       await store.update(memory.id, { content: 'First update' });
 
-      // Now attempt update with stale version (1) using the internal version-aware method
+      // Attempt _updateWithVersion with stale expected version (1); current is 2
       await expect(
-        (store as any).updateWithVersion(memory.id, { content: 'Stale update' }, 1),
+        (store as any)._updateWithVersion(memory.id, { content: 'Stale update' }, 1),
       ).rejects.toThrow(ConcurrentUpdateError);
     });
   });
@@ -232,9 +232,14 @@ describe('SqliteMemoryStore', () => {
     it('dry run returns candidates without deleting', async () => {
       await store.store({ content: 'Potentially prunable memory', category: 'other', tags: [] });
 
+      const statsBeforePrune = (await store.stats()).totalMemories;
+
       const result = await store.prune({ dryRun: true, minStrength: 0.99 });
       expect(result.dryRun).toBe(true);
       expect(result.inspected).toBeGreaterThan(0);
+
+      const statsAfter = await store.stats();
+      expect(statsAfter.totalMemories).toBe(statsBeforePrune); // DB unchanged
     });
 
     it('prune with low threshold removes old memories when not dry run', async () => {
