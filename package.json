@@ -1,7 +1,7 @@
 {
   "name": "@aabadin/agent-memory-mcp",
   "version": "2.0.0",
-  "description": "MCP server for persistent agent memory — hybrid BM25 + vector search backed by LanceDB with local ONNX embeddings. No API keys, fully local.",
+  "description": "MCP server for a memory system backed by SQLite with hybrid BM25 FTS5 + vector search",
   "license": "GPL-3.0-or-later",
   "type": "module",
   "main": "dist/index.js",
@@ -34,9 +34,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/adamrdrew/agent-memory-mcp.git"
+    "url": "git+https://github.com/adrianabadin/agent-memory-mcp.git"
   },
-  "author": "Adam Drew",
+  "author": "Adrian Abadin",
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@lancedb/lancedb": "^0.26.2",
