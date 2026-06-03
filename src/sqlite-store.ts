@@ -321,6 +321,7 @@ export class SqliteMemoryStore implements MemoryStore {
       const escaped = escapeFtsQuery(query);
       // bm25() returns negative values: lower (more negative) = better match
       // We negate to get positive score where higher = better
+      type FtsRow = MemoryRow & { fts_score: number };
       const rows = this.db.prepare(`
         SELECT m.*, -bm25(memories_fts) AS fts_score
         FROM memories_fts
@@ -328,9 +329,10 @@ export class SqliteMemoryStore implements MemoryStore {
         WHERE memories_fts MATCH ?
         ORDER BY bm25(memories_fts)
         LIMIT ?
-      `).all(escaped, limit * 3) as (MemoryRow & { fts_score: number })[];
+      `).all(escaped, limit * 3) as unknown as FtsRow[];
 
-      return this.applyFiltersAndDecay(rows, filters, (r) => r.fts_score ?? 1, limit, trackAccess);
+      const ftsScoreMap = new Map(rows.map(r => [r.id, r.fts_score]));
+      return this.applyFiltersAndDecay(rows, filters, (r) => ftsScoreMap.get(r.id) ?? 1, limit, trackAccess);
     } catch {
       return [];
     }
@@ -358,7 +360,7 @@ export class SqliteMemoryStore implements MemoryStore {
       `SELECT m.*, e.embedding
        FROM memories m
        JOIN memory_embeddings e ON e.id = m.id`,
-    ).all() as (MemoryRow & { embedding: Buffer | Uint8Array })[];
+    ).all() as unknown as (MemoryRow & { embedding: Buffer | Uint8Array })[];
 
     const scored = rows
       .filter(r => r.id !== excludeId)
@@ -487,11 +489,11 @@ export class SqliteMemoryStore implements MemoryStore {
     if (category) {
       rows = this.db.prepare(
         `SELECT * FROM memories WHERE category = ? ORDER BY created_at DESC LIMIT ?`,
-      ).all(category, limit) as MemoryRow[];
+      ).all(category, limit) as unknown as MemoryRow[];
     } else {
       rows = this.db.prepare(
         `SELECT * FROM memories ORDER BY created_at DESC LIMIT ?`,
-      ).all(limit) as MemoryRow[];
+      ).all(limit) as unknown as MemoryRow[];
     }
     return rows.map(rowToMemory);
   }
@@ -559,7 +561,7 @@ export class SqliteMemoryStore implements MemoryStore {
 
     const updated = this.db.prepare(
       `SELECT * FROM memories WHERE id = ?`,
-    ).get(id) as MemoryRow;
+    ).get(id) as unknown as MemoryRow;
 
     return rowToMemory(updated);
   }
@@ -579,7 +581,7 @@ export class SqliteMemoryStore implements MemoryStore {
   async stats(): Promise<MemoryStats> {
     const rows = this.db.prepare(
       `SELECT * FROM memories`,
-    ).all() as MemoryRow[];
+    ).all() as unknown as MemoryRow[];
 
     if (rows.length === 0) {
       return {
@@ -648,7 +650,7 @@ export class SqliteMemoryStore implements MemoryStore {
   async prune(options: PruneOptions = {}): Promise<PruneResult> {
     const { dryRun = true, minStrength = 0.05, maxDormantDays = 90 } = options;
 
-    const rows = this.db.prepare(`SELECT * FROM memories`).all() as MemoryRow[];
+    const rows = this.db.prepare(`SELECT * FROM memories`).all() as unknown as MemoryRow[];
     const candidates: PruneResult['candidates'] = [];
 
     for (const row of rows) {

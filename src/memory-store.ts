@@ -13,6 +13,7 @@ import type {
   StoreRequest,
   UpdateRequest,
 } from './types.js';
+import { ConcurrentUpdateError, EmbeddingDimensionMismatchError, MemoryNotFoundError } from './errors.js';
 
 // ── LanceDB row type ───────────────────────────────────────────────
 // Uses Record so it's assignable to LanceDB's Data parameter.
@@ -27,6 +28,7 @@ type MemoryRow = Record<string, unknown> & {
   vector: number[];
   access_count: number;
   last_accessed_at: string;
+  version: number;
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -62,6 +64,7 @@ export class LanceMemoryStore implements MemoryStore {
     const names = await this.db.tableNames();
     if (names.includes('memories')) {
       this.table = await this.db.openTable('memories');
+      await this.validateVectorSchema();
       // Migrate schema: add access_count and last_accessed_at columns if missing.
       // These were introduced in v1.1.2 for importance-driven decay.
       await this.migrateSchema();
@@ -90,10 +93,34 @@ export class LanceMemoryStore implements MemoryStore {
         ]);
         console.log('[MemoryStore] Schema migration complete');
       }
+      // Add version column if missing (introduced for optimistic concurrency control).
+      if (probe.length > 0 && !('version' in probe[0])) {
+        console.log('[MemoryStore] Migrating schema: adding version column');
+        await this.table.addColumns([{ name: 'version', valueSql: '1' }]);
+        console.log('[MemoryStore] Version column migration complete');
+      }
     } catch (err) {
       // Non-fatal: if migration fails, the store degrades gracefully
       // (null coalescing in importanceMultiplier handles missing fields)
       console.warn('[MemoryStore] Schema migration failed (non-fatal):', err);
+    }
+  }
+
+  private async validateVectorSchema(): Promise<void> {
+    if (!this.table) return;
+
+    const schema = await this.table.schema();
+    const vectorField = (schema.fields ?? []).find((field) => (field as unknown as Record<string, unknown>).name === 'vector') as
+      | { type?: { listSize?: number } }
+      | undefined;
+
+    const actualDimensions = typeof vectorField?.type?.listSize === 'number'
+      ? vectorField.type.listSize
+      : null;
+    const expectedDimensions = this.embedder.dimensions();
+
+    if (actualDimensions !== null && actualDimensions !== expectedDimensions) {
+      throw new EmbeddingDimensionMismatchError(this.dbPath, expectedDimensions, actualDimensions);
     }
   }
 
@@ -199,11 +226,12 @@ export class LanceMemoryStore implements MemoryStore {
   // ── Mutation ────────────────────────────────────────────────────
 
   async update(id: string, updates: UpdateRequest): Promise<Memory> {
-    if (!this.table) throw new Error('No memories stored yet');
+    if (!this.table) throw new MemoryNotFoundError(id);
 
     const existing = await this.fetchById(id);
-    if (!existing) throw new Error(`Memory ${id} not found`);
+    if (!existing) throw new MemoryNotFoundError(id);
 
+    const expectedVersion = (existing.version as number) ?? 1;
     const content = updates.content ?? (existing.content as string);
     const category = updates.category ?? (existing.category as string);
     const tags = updates.tags ?? JSON.parse(existing.tags as string);
@@ -211,7 +239,7 @@ export class LanceMemoryStore implements MemoryStore {
 
     const vector = updates.content
       ? await this.embedder.embed(content)
-      : existing.vector as number[];
+      : (existing.vector as number[]);
 
     const updatedRow: MemoryRow = {
       id,
@@ -223,11 +251,25 @@ export class LanceMemoryStore implements MemoryStore {
       vector,
       access_count: safeAccessCount(existing),
       last_accessed_at: (existing.last_accessed_at as string) ?? (existing.updated_at as string),
+      version: expectedVersion + 1,
     };
 
-    await this.table.delete(`id = '${sanitise(id)}'`);
-    await this.table.add([updatedRow]);
+    // Conditional delete: only removes the row if the version matches.
+    // If a concurrent writer already updated (bumped version), this deletes nothing.
+    await this.table.delete(`id = '${sanitise(id)}' AND version = ${expectedVersion}`);
 
+    // Re-fetch to determine whether our conditional delete succeeded.
+    const afterDelete = await this.fetchById(id);
+    if (afterDelete !== null) {
+      // Row still exists — another writer updated it before us.
+      throw new ConcurrentUpdateError(
+        id,
+        expectedVersion,
+        (afterDelete.version as number) ?? null,
+      );
+    }
+
+    await this.table.add([updatedRow]);
     return rowToMemory(updatedRow);
   }
 
@@ -519,6 +561,7 @@ function toRow(request: StoreRequest, vector: number[], timestamp: string): Memo
     vector,
     access_count: 0,
     last_accessed_at: timestamp,
+    version: 1,
   };
 }
 
@@ -530,6 +573,7 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     tags: JSON.parse(row.tags as string),
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
+    version: (row.version as number) ?? 1,
   };
 }
 
