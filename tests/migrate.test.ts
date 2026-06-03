@@ -43,6 +43,7 @@ vi.mock('../src/memory-store.js', async (importOriginal) => {
 
 // Import after mocking
 import { migrateLanceToSqlite } from '../src/migrate.js';
+import * as migrateModule from '../src/migrate.js';
 import { createStore } from '../src/store-factory.js';
 import { SqliteMemoryStore } from '../src/sqlite-store.js';
 
@@ -173,16 +174,18 @@ describe('createStore', () => {
   });
 
   it('catches migration errors and returns a fresh store instead of throwing', async () => {
-    // Simulate LanceDB dir
-    await mkdir(dbBase, { recursive: true });
+    // Simulate LanceDB dir so createStore attempts migration
+    const lanceDir = join(tmpDir, 'fail-lance');
+    await mkdir(lanceDir, { recursive: true });
+    const dbPath = join(tmpDir, 'fail-lance');
 
-    // We verify that createStore does NOT throw even when something fails internally.
-    // The mock LanceStore works fine, so to exercise the catch branch we'd need to
-    // cause an error. Here we simply verify the overall contract: always returns a usable store.
-    const store = await createStore(dbBase, embedder);
+    // Force migrateLanceToSqlite to throw, exercising the catch branch in createStore
+    vi.spyOn(migrateModule, 'migrateLanceToSqlite').mockRejectedValueOnce(new Error('simulated failure'));
+
+    const store = await createStore(dbPath, embedder);
     try {
-      const memories = await store.listRecent(100);
-      expect(Array.isArray(memories)).toBe(true);
+      const stats = await store.stats();
+      expect(stats.totalMemories).toBe(0); // fresh store, no data
     } finally {
       store.close();
     }

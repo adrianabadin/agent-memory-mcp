@@ -25,6 +25,12 @@ export async function migrateLanceToSqlite(
   // 2. Fetch all memories
   const memories = await lanceStore.listRecent(999_999);
 
+  // Pre-emptive close — LanceMemoryStore may not currently expose close(),
+  // but guard defensively for future compatibility.
+  if (typeof (lanceStore as any).close === 'function') {
+    await (lanceStore as any).close();
+  }
+
   // 3. Open SQLite store and write
   const sqliteStore = new SqliteMemoryStore(sqliteDbPath, embedder);
   await sqliteStore.initialize();

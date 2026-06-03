@@ -241,6 +241,11 @@ export class SqliteMemoryStore implements MemoryStore {
       for (const { m, vec } of embedded) {
         const id = (m as any).id ?? randomUUID();
         const tags = JSON.stringify(m.tags ?? []);
+        const createdAt = (m as any).created_at ?? (m as any).createdAt ?? now;
+        const updatedAt = (m as any).updated_at ?? (m as any).updatedAt ?? now;
+        const accessCount = (m as any).access_count ?? 0;
+        const lastAccessedAt = (m as any).last_accessed_at ?? now;
+        const version = (m as any).version ?? 1;
 
         this.db.prepare(
           `INSERT INTO memories
@@ -251,7 +256,7 @@ export class SqliteMemoryStore implements MemoryStore {
              category       = excluded.category,
              tags           = excluded.tags,
              updated_at     = excluded.updated_at`,
-        ).run(id, m.content, m.category, tags, now, now, 0, now, 1);
+        ).run(id, m.content, m.category, tags, createdAt, updatedAt, accessCount, lastAccessedAt, version);
 
         this.db.prepare(
           `INSERT OR REPLACE INTO memory_embeddings (id, embedding) VALUES (?, ?)`,
@@ -262,9 +267,9 @@ export class SqliteMemoryStore implements MemoryStore {
           content: m.content,
           category: m.category,
           tags: m.tags ?? [],
-          createdAt: now,
-          updatedAt: now,
-          version: 1,
+          createdAt,
+          updatedAt,
+          version,
         });
       }
       this.db.exec('COMMIT');
