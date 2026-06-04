@@ -4,7 +4,7 @@ import {
   importanceMultiplier,
   parseDecayHalfLife,
   EVERGREEN_TAGS,
-} from '../src/memory-store.js';
+} from '../src/decay.js';
 
 // ── Unit tests for temporal decay functions ───────────────────────
 //
