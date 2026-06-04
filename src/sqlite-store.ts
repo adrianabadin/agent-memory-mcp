@@ -20,7 +20,7 @@ import {
   parseDecayHalfLife,
   importanceMultiplier,
   EVERGREEN_TAGS,
-} from './memory-store.js';
+} from './decay.js';
 
 // ── Schema ─────────────────────────────────────────────────────────
 
