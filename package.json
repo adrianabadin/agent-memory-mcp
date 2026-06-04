@@ -1,7 +1,7 @@
 {
   "name": "@aabadin/agent-memory-mcp",
   "version": "2.0.0",
-  "description": "MCP server for a memory system backed by SQLite with hybrid BM25 FTS5 + vector search",
+  "description": "MCP server for agent memory backed by SQLite (WAL mode) with hybrid FTS5 BM25 + cosine vector search",
   "license": "GPL-3.0-or-later",
   "type": "module",
   "main": "dist/index.js",
@@ -20,17 +20,17 @@
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "migrate": "tsx scripts/migrate-lance.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
     "mcp",
     "memory",
-    "lancedb",
+    "sqlite",
+    "embeddings",
     "vector-search",
     "bm25",
-    "embeddings",
-    "model-context-protocol",
-    "agent-memory"
+    "agent"
   ],
   "repository": {
     "type": "git",
@@ -39,11 +39,11 @@
   "author": "Adrian Abadin",
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
-    "@lancedb/lancedb": "^0.26.2",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@lancedb/lancedb": "^0.26.2",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
