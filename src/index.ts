@@ -5,6 +5,7 @@ import { TransformersEmbedder } from './embedder.js';
 import { HardcopyMemoryStore } from './hardcopy-store.js';
 import { createStore } from './store-factory.js';
 import { createServer } from './server.js';
+import { createGlobalStore } from './global/global-factory.js';
 import type { MemoryStore } from './types.js';
 
 async function main(): Promise<void> {
@@ -29,7 +30,13 @@ async function main(): Promise<void> {
     console.error(`[hardcopy] Mirroring mutations to ${process.env.HARDCOPY_PATH}`);
   }
 
-  const server = createServer(store);
+  // ── Global context store (optional — failure does not block startup) ──
+  const globalStore = await createGlobalStore(embedder);
+  if (globalStore) {
+    console.error(`[global] Global context store ready`);
+  }
+
+  const server = createServer(store, globalStore ?? undefined);
 
   // ── Initialise (download model on first run, connect to DB) ──
   await embedder.initialize();

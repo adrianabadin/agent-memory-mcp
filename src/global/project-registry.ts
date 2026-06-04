@@ -111,7 +111,7 @@ export class ProjectRegistry {
     const setClause = fields.map(([col]) => `${col} = ?`).join(', ');
     const values = fields.map(([, v]) => v);
 
-    this.db.prepare(`UPDATE projects SET ${setClause} WHERE id = ?`).run(...values, id);
+    this.db.prepare(`UPDATE projects SET ${setClause} WHERE id = ?`).run(...(values as string[]), id);
     return this.get(id)!;
   }
 

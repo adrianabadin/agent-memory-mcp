@@ -7,6 +7,7 @@ import {
   type SearchResult,
   type StoreRequest,
 } from './types.js';
+import type { GlobalStore } from './global/global-store.js';
 
 // ── Zod schemas ────────────────────────────────────────────────────
 
@@ -205,9 +206,102 @@ export function handlePrune(store: MemoryStore) {
   };
 }
 
+// ── Global context tool handlers ──────────────────────────────────
+
+export function handleRegisterProject(globalStore: GlobalStore) {
+  return async (args: {
+    name: string;
+    rootPath: string;
+    objective?: string;
+    stack?: unknown;
+    architecture?: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const rec = globalStore.registerProject({
+        name: args.name,
+        rootPath: args.rootPath,
+        objective: args.objective,
+        stack: args.stack,
+        architecture: args.architecture,
+      });
+      return success(rec);
+    } catch (err) {
+      return error(`register_project failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleSyncProjectMetadata(globalStore: GlobalStore) {
+  return async (args: {
+    projectId: string;
+    objective?: string;
+    stack?: unknown;
+    architecture?: string;
+    dependencies?: unknown;
+    minimap?: unknown;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const rec = globalStore.syncMetadata(args.projectId, {
+        objective: args.objective,
+        stack: args.stack,
+        architecture: args.architecture,
+        dependencies: args.dependencies,
+        minimap: args.minimap,
+      });
+      return success(rec);
+    } catch (err) {
+      return error(`sync_project_metadata failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleRecordError(globalStore: GlobalStore) {
+  return async (args: {
+    projectId: string;
+    message: string;
+    stack?: string;
+    rootCause?: string;
+    fix: string;
+    files?: string[];
+    tags?: string[];
+    source: 'auto' | 'manual';
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const rec = await globalStore.recordError({
+        projectId: args.projectId,
+        message: args.message,
+        stack: args.stack,
+        rootCause: args.rootCause,
+        fix: args.fix,
+        files: args.files,
+        tags: args.tags,
+        source: args.source,
+      });
+      return success(rec);
+    } catch (err) {
+      return error(`record_error failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleSearchGlobalErrors(globalStore: GlobalStore) {
+  return async (args: {
+    query: string;
+    projectId?: string;
+    limit?: number;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const results = await globalStore.searchErrors(args.query, args.projectId, args.limit);
+      return success({ count: results.length, results });
+    } catch (err) {
+      return error(`search_global_errors failed: ${String(err)}`);
+    }
+  };
+}
+
 // ── Registration ───────────────────────────────────────────────────
 
-export function registerTools(server: McpServer, store: MemoryStore): void {
+export function registerTools(server: McpServer, store: MemoryStore, globalStore?: GlobalStore): void {
   // ── Storage tools ──
 
   server.tool(
@@ -318,4 +412,61 @@ export function registerTools(server: McpServer, store: MemoryStore): void {
     },
     handlePrune(store),
   );
+
+  // ── Global context tools (registered only when globalStore is provided) ──
+  if (globalStore) {
+    server.tool(
+      'register_project',
+      'Register a project in the global context store. Idempotent — safe to call on every pmc init.',
+      {
+        name: z.string().describe('Project name (e.g. repo name)'),
+        rootPath: z.string().describe('Absolute path to the project root'),
+        objective: z.string().optional().describe('One-sentence project objective'),
+        stack: z.unknown().optional().describe('Languages/frameworks as JSON object'),
+        architecture: z.string().optional().describe('Architecture summary'),
+      },
+      handleRegisterProject(globalStore),
+    );
+
+    server.tool(
+      'sync_project_metadata',
+      'Update the global context snapshot for a project: objective, architecture, dependencies, minimap.',
+      {
+        projectId: z.string().describe('Project ID (from register_project)'),
+        objective: z.string().optional(),
+        stack: z.unknown().optional(),
+        architecture: z.string().optional(),
+        dependencies: z.unknown().optional(),
+        minimap: z.unknown().optional(),
+      },
+      handleSyncProjectMetadata(globalStore),
+    );
+
+    server.tool(
+      'record_error',
+      'Record a debugged error and its solution in the global error database. Deduplicated by (message + root_cause) per project.',
+      {
+        projectId: z.string().describe('Project ID where this error occurred'),
+        message: z.string().describe('Error message or exception text'),
+        stack: z.string().optional().describe('Stack trace'),
+        rootCause: z.string().optional().describe('Root cause analysis'),
+        fix: z.string().describe('Solution that resolved the error'),
+        files: z.array(z.string()).optional().describe('Files affected'),
+        tags: z.array(z.string()).optional(),
+        source: z.enum(['auto', 'manual']).describe('auto = from KNOWN-ISSUES-AND-FIXES.md, manual = live'),
+      },
+      handleRecordError(globalStore),
+    );
+
+    server.tool(
+      'search_global_errors',
+      'Search the global cross-project error database for similar errors and their solutions. Hybrid FTS5 + semantic search.',
+      {
+        query: z.string().describe('Error description or symptom to search for'),
+        projectId: z.string().optional().describe('Filter to a specific project ID'),
+        limit: z.number().optional().describe('Max results (default 10)'),
+      },
+      handleSearchGlobalErrors(globalStore),
+    );
+  }
 }
