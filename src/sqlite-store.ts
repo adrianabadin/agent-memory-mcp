@@ -493,36 +493,47 @@ export class SqliteMemoryStore implements MemoryStore {
     const newContent = updates.content ?? existing.content;
     const newCategory = updates.category ?? existing.category;
     const newTags = updates.tags ? JSON.stringify(updates.tags) : existing.tags;
+    const embedding = updates.content !== undefined
+      ? await this.embedder.embed(newContent)
+      : null;
 
-    const result = this.db.prepare(
-      `UPDATE memories
-       SET content = ?, category = ?, tags = ?, updated_at = ?, version = version + 1
-       WHERE id = ? AND version = ?`,
-    ).run(newContent, newCategory, newTags, now, id, expectedVersion) as { changes: number };
+    this.db.exec('BEGIN');
+    try {
+      const result = this.db.prepare(
+        `UPDATE memories
+         SET content = ?, category = ?, tags = ?, updated_at = ?, version = version + 1
+         WHERE id = ? AND version = ?`,
+      ).run(newContent, newCategory, newTags, now, id, expectedVersion) as { changes: number };
 
-    if (result.changes === 0) {
-      // Row exists but version doesn't match — concurrent writer updated it
-      const current = this.db.prepare(
-        `SELECT version FROM memories WHERE id = ?`,
-      ).get(id) as { version: number } | undefined;
+      if (result.changes === 0) {
+        const current = this.db.prepare(
+          `SELECT version FROM memories WHERE id = ?`,
+        ).get(id) as { version: number } | undefined;
 
-      if (!current) throw new MemoryNotFoundError(id);
-      throw new ConcurrentUpdateError(id, expectedVersion, current.version);
+        if (!current) throw new MemoryNotFoundError(id);
+        throw new ConcurrentUpdateError(id, expectedVersion, current.version);
+      }
+
+      if (embedding) {
+        this.db.prepare(
+          `INSERT OR REPLACE INTO memory_embeddings (id, embedding) VALUES (?, ?)`,
+        ).run(id, embeddingToBlob(embedding));
+      }
+
+      const updated = this.db.prepare(
+        `SELECT * FROM memories WHERE id = ?`,
+      ).get(id) as unknown as MemoryRow;
+
+      this.db.exec('COMMIT');
+      return rowToMemory(updated);
+    } catch (e) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Ignore rollback failure so the original error is preserved.
+      }
+      throw e;
     }
-
-    // Re-embed if content changed (use !== undefined to handle empty string content)
-    if (updates.content !== undefined) {
-      const embedding = await this.embedder.embed(newContent);
-      this.db.prepare(
-        `INSERT OR REPLACE INTO memory_embeddings (id, embedding) VALUES (?, ?)`,
-      ).run(id, embeddingToBlob(embedding));
-    }
-
-    const updated = this.db.prepare(
-      `SELECT * FROM memories WHERE id = ?`,
-    ).get(id) as unknown as MemoryRow;
-
-    return rowToMemory(updated);
   }
 
   // ── delete() ─────────────────────────────────────────────────────

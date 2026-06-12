@@ -5,15 +5,18 @@ import { tmpdir } from 'os';
 import { SqliteMemoryStore } from '../src/sqlite-store.js';
 import { ConcurrentUpdateError, MemoryNotFoundError } from '../src/errors.js';
 import { MockEmbedder } from './mocks.js';
+import { blobToEmbedding, embeddingToBlob } from '../src/shared/vector-utils.js';
 
 describe('optimistic concurrency control', () => {
   let store: SqliteMemoryStore;
   let dbPath: string;
+  let embedder: MockEmbedder;
 
   beforeEach(async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), 'concurrent-test-'));
     dbPath = join(tmpDir, 'test.db');
-    store = new SqliteMemoryStore(dbPath, new MockEmbedder());
+    embedder = new MockEmbedder();
+    store = new SqliteMemoryStore(dbPath, embedder);
     await store.initialize();
   });
 
@@ -108,5 +111,57 @@ describe('optimistic concurrency control', () => {
     await store.update(mem.id, { content: 'changed' });
     const stats = await store.stats();
     expect(stats.totalMemories).toBe(1);
+  });
+
+  it('embedder failure leaves the row untouched', async () => {
+    class FailOnSecondEmbedder extends MockEmbedder {
+      private calls = 0;
+
+      override async embed(text: string): Promise<number[]> {
+        this.calls += 1;
+        if (this.calls >= 2) {
+          throw new Error('embed failed');
+        }
+        return super.embed(text);
+      }
+    }
+
+    const failingStore = new SqliteMemoryStore(dbPath, new FailOnSecondEmbedder());
+    await failingStore.initialize();
+
+    try {
+      const mem = await failingStore.store({ content: 'original', category: 'other', tags: [] });
+
+      await expect(
+        failingStore.update(mem.id, { content: 'new' }),
+      ).rejects.toThrow('embed failed');
+
+      const row = (failingStore as any).db.prepare(
+        'SELECT content, version FROM memories WHERE id = ?',
+      ).get(mem.id) as { content: string; version: number };
+
+      expect(row.content).toBe('original');
+      expect(row.version).toBe(1);
+    } finally {
+      failingStore.close();
+    }
+  });
+
+  it('content and embedding move together on update', async () => {
+    const mem = await store.store({ content: 'original', category: 'other', tags: [] });
+    const updated = await store.update(mem.id, { content: 'updated' });
+
+    const row = (store as any).db.prepare(
+      'SELECT embedding FROM memory_embeddings WHERE id = ?',
+    ).get(mem.id) as { embedding: Buffer };
+
+    const expectedEmbedder = new MockEmbedder();
+    const expected = blobToEmbedding(
+      embeddingToBlob(await expectedEmbedder.embed('updated')),
+    );
+
+    expect(updated.content).toBe('updated');
+    expect(updated.version).toBe(2);
+    expect(blobToEmbedding(row.embedding)).toEqual(expected);
   });
 });
