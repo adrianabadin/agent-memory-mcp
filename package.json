@@ -1,6 +1,6 @@
 {
   "name": "@aabadin/agent-memory-mcp",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "MCP server for agent memory backed by SQLite (WAL mode) with hybrid FTS5 BM25 + cosine vector search",
   "license": "GPL-3.0-or-later",
   "type": "module",
@@ -47,7 +47,7 @@
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0"
+    "vitest": "^4.1.8"
   },
   "engines": {
     "node": ">=22.5.0"
