@@ -1,4 +1,4 @@
-import { mkdir, writeFile, unlink } from 'fs/promises';
+import { mkdir, writeFile, rename, unlink } from 'fs/promises';
 import { join } from 'path';
 import type {
   Memory,
@@ -84,18 +84,35 @@ export class HardcopyMemoryStore implements MemoryStore {
 
   // ── Private ─────────────────────────────────────────────────
 
+  private safeIdPath(id: string): string | null {
+    if (!/^[A-Za-z0-9._-]+$/.test(id) || id.includes('..')) return null;
+    return join(this.hardcopyPath, `${id}.json`);
+  }
+
   private async writeHardcopy(memory: Memory): Promise<void> {
+    const finalPath = this.safeIdPath(memory.id);
+    if (!finalPath) {
+      console.error(`[hardcopy] Skipping unsafe memory id: ${JSON.stringify(memory.id)}`);
+      return;
+    }
+    const tmpPath = `${finalPath}.tmp.${process.pid}`;
     try {
-      const filePath = join(this.hardcopyPath, `${memory.id}.json`);
-      await writeFile(filePath, JSON.stringify(memory, null, 2) + '\n');
+      await writeFile(tmpPath, JSON.stringify(memory, null, 2) + '\n');
+      await rename(tmpPath, finalPath);
     } catch (err) {
+      // Best-effort: clean up temp file, then ignore error
+      try { await unlink(tmpPath); } catch {}
       console.error(`[hardcopy] Failed to write ${memory.id}:`, err);
     }
   }
 
   private async deleteHardcopy(id: string): Promise<void> {
+    const filePath = this.safeIdPath(id);
+    if (!filePath) {
+      console.error(`[hardcopy] Skipping unsafe memory id: ${JSON.stringify(id)}`);
+      return;
+    }
     try {
-      const filePath = join(this.hardcopyPath, `${id}.json`);
       await unlink(filePath);
     } catch (err) {
       // File may not exist (e.g. hardcopy was enabled after the memory

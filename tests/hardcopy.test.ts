@@ -4,7 +4,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { HardcopyMemoryStore } from '../src/hardcopy-store.js';
 import { MockMemoryStore } from './mocks.js';
-import type { Memory } from '../src/types.js';
+import type { Memory, MemoryStore } from '../src/types.js';
 
 describe('HardcopyMemoryStore', () => {
   let inner: MockMemoryStore;
@@ -31,6 +31,22 @@ describe('HardcopyMemoryStore', () => {
   async function readHardcopy(id: string): Promise<Memory> {
     const content = await readFile(join(hardcopyPath, `${id}.json`), 'utf-8');
     return JSON.parse(content);
+  }
+
+  function withOverrides(overrides: Partial<MemoryStore>): MemoryStore {
+    return {
+      initialize: () => inner.initialize(),
+      store: (request) => inner.store(request),
+      storeBatch: (requests) => inner.storeBatch(requests),
+      search: (query, mode, filters) => inner.search(query, mode, filters),
+      findRelated: (memoryId, limit) => inner.findRelated(memoryId, limit),
+      listRecent: (limit, category) => inner.listRecent(limit, category),
+      update: (id, updates) => inner.update(id, updates),
+      delete: (id) => inner.delete(id),
+      stats: () => inner.stats(),
+      prune: (options) => inner.prune(options),
+      ...overrides,
+    };
   }
 
   // ── Store ───────────────────────────────────────────────────
@@ -179,6 +195,53 @@ describe('HardcopyMemoryStore', () => {
 
       // Should end with a newline
       expect(raw.endsWith('\n')).toBe(true);
+    });
+  });
+
+  // ── ID validation ────────────────────────────────────────────
+
+  describe('id validation', () => {
+    it('rejects path-escaping ids for write', async () => {
+      let hostileCalled = false;
+      const overrideStore = withOverrides({
+        async store(request) {
+          const m = await inner.store(request);
+          hostileCalled = true;
+          return { ...m, id: '../escape' };
+        },
+      });
+      const guarded = new HardcopyMemoryStore(overrideStore, hardcopyPath);
+      await guarded.initialize();
+
+      await guarded.store({ content: 'evil', category: 'other', tags: [] });
+      expect(hostileCalled).toBe(true);
+      const files = await readdir(hardcopyPath);
+      expect(files.filter(f => f.includes('escape'))).toHaveLength(0);
+    });
+
+    it('rejects path-escaping ids for delete', async () => {
+      let deleteCalled = false;
+      const overrideStore = withOverrides({
+        async delete(_id: string) {
+          deleteCalled = true;
+        },
+      });
+      const guarded = new HardcopyMemoryStore(overrideStore, hardcopyPath);
+      await guarded.initialize();
+      await guarded.delete('../escape');
+      expect(deleteCalled).toBe(true);
+      const files = await readdir(hardcopyPath);
+      expect(files.filter(f => f.includes('escape'))).toHaveLength(0);
+    });
+
+    it('still writes normal UUID ids', async () => {
+      const memory = await store.store({
+        content: 'Safe',
+        category: 'learning',
+        tags: ['safe'],
+      });
+      const files = await listHardcopyFiles();
+      expect(files).toContain(`${memory.id}.json`);
     });
   });
 });
