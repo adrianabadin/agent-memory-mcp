@@ -26,11 +26,28 @@ export interface Memory {
   tags: string[];
   createdAt: string;
   updatedAt: string;
+  version: number;
+}
+
+export interface ExplainPayload {
+  keyword: { rank: number; bm25: number } | null;
+  semantic: { rank: number; cosine: number } | null;
+  rrfScore: number;
+  decayFactor: number;
+  finalScore: number;
+}
+
+export interface ExplainSummary {
+  keywordCandidates: number;
+  semanticCandidates: number;
+  fusedCount: number;
+  query: { fts: string };
 }
 
 export interface SearchResult {
   memory: Memory;
   score: number;
+  explain?: ExplainPayload;
 }
 
 export interface MemoryStats {
@@ -78,6 +95,7 @@ export interface SearchFilters {
   after?: string;
   before?: string;
   limit?: number;
+  explain?: boolean;
 }
 
 export type SearchMode = 'hybrid' | 'keyword' | 'semantic';

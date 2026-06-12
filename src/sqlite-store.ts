@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import type {
   Embedder,
+  ExplainSummary,
   Memory,
   MemoryCategory,
   MemoryStats,
@@ -120,6 +121,13 @@ function applyDecay(row: MemoryRow, rawScore: number): number {
   if (DECAY_HALF_LIFE_DAYS <= 0 || isEvergreen(row)) return rawScore;
   const effectiveHalfLife = DECAY_HALF_LIFE_DAYS * importanceMultiplier(row as unknown as Record<string, unknown>);
   return rawScore * computeDecayFactor(row.updated_at, effectiveHalfLife);
+}
+
+function applyDecayWithFactor(row: MemoryRow, rawScore: number): { score: number; factor: number } {
+  if (DECAY_HALF_LIFE_DAYS <= 0 || isEvergreen(row)) return { score: rawScore, factor: 1 };
+  const effectiveHalfLife = DECAY_HALF_LIFE_DAYS * importanceMultiplier(row as unknown as Record<string, unknown>);
+  const factor = computeDecayFactor(row.updated_at, effectiveHalfLife);
+  return { score: rawScore * factor, factor };
 }
 
 // ── SqliteMemoryStore ─────────────────────────────────────────────
@@ -273,6 +281,7 @@ export class SqliteMemoryStore implements MemoryStore {
     filters: SearchFilters,
     limit: number,
     trackAccess: boolean = true,
+    rawScores?: Map<string, number>,
   ): SearchResult[] {
     if (!query.trim()) return [];
 
@@ -291,6 +300,9 @@ export class SqliteMemoryStore implements MemoryStore {
       `).all(escaped, limit * 3) as unknown as FtsRow[];
 
       const ftsScoreMap = new Map(rows.map(r => [r.id, r.fts_score]));
+      if (rawScores) {
+        for (const [id, score] of ftsScoreMap) rawScores.set(id, score);
+      }
       return this.applyFiltersAndDecay(rows, filters, (r) => ftsScoreMap.get(r.id) ?? 1, limit, trackAccess);
     } catch {
       return [];
@@ -302,9 +314,10 @@ export class SqliteMemoryStore implements MemoryStore {
     filters: SearchFilters,
     limit: number,
     trackAccess: boolean = true,
+    rawScores?: Map<string, number>,
   ): Promise<SearchResult[]> {
     const queryVec = await this.embedder.embed(query);
-    return this.vectorSearch(queryVec, filters, limit, null, trackAccess);
+    return this.vectorSearch(queryVec, filters, limit, null, trackAccess, rawScores);
   }
 
   private vectorSearch(
@@ -313,6 +326,7 @@ export class SqliteMemoryStore implements MemoryStore {
     limit: number,
     excludeId: string | null,
     trackAccess: boolean = true,
+    rawScores?: Map<string, number>,
   ): SearchResult[] {
     // Fetch all embeddings + row data and compute cosine in-process
     const rows = this.db.prepare(
@@ -331,6 +345,9 @@ export class SqliteMemoryStore implements MemoryStore {
 
     // Build scoreMap once (O(N)) before calling applyFiltersAndDecay
     const scoreMap = new Map(scored.map(s => [s.row.id, s.rawScore]));
+    if (rawScores) {
+      for (const [id, score] of scoreMap) rawScores.set(id, score);
+    }
     return this.applyFiltersAndDecay(
       scored.map(s => s.row),
       filters,
@@ -345,28 +362,79 @@ export class SqliteMemoryStore implements MemoryStore {
     filters: SearchFilters,
     limit: number,
   ): Promise<SearchResult[]> {
+    return (await this._hybridSearchCore(query, filters, limit)).results;
+  }
+
+  private async _hybridSearchCore(
+    query: string,
+    filters: SearchFilters,
+    limit: number,
+  ): Promise<{ results: SearchResult[]; summary?: ExplainSummary }> {
+    const explain = filters.explain ?? false;
+    const kwRaw = explain ? new Map<string, number>() : undefined;
+    const semRaw = explain ? new Map<string, number>() : undefined;
+
     // Pass trackAccess=false to avoid double-incrementing access_count
     const [keywordResults, semanticResults] = await Promise.all([
-      Promise.resolve(this.keywordSearch(query, filters, limit * 2, false)),
-      this.semanticSearch(query, filters, limit * 2, false),
+      Promise.resolve(this.keywordSearch(query, filters, limit * 2, false, kwRaw)),
+      this.semanticSearch(query, filters, limit * 2, false, semRaw),
     ]);
 
-    if (keywordResults.length === 0 && semanticResults.length === 0) return [];
+    if (keywordResults.length === 0 && semanticResults.length === 0) return { results: [] };
 
     // Build merged result set via RRF
     const kwList = keywordResults.map(r => ({ id: r.memory.id, score: r.score }));
     const semList = semanticResults.map(r => ({ id: r.memory.id, score: r.score }));
 
+    // Capture per-id rank before fusion (0-based)
+    const kwRank = new Map(kwList.map(({ id }, i) => [id, i]));
+    const semRank = new Map(semList.map(({ id }, i) => [id, i]));
+
     const merged = rrf([kwList, semList]);
     const idToMemory = new Map<string, Memory>();
+    const idToRow = new Map<string, MemoryRow>();
     for (const r of [...keywordResults, ...semanticResults]) {
       idToMemory.set(r.memory.id, r.memory);
+    }
+    if (explain) {
+      // Re-fetch rows for decay factor computation (explain path only)
+      const ids = [...idToMemory.keys()];
+      if (ids.length > 0) {
+        const placeholders = ids.map(() => '?').join(',');
+        const rows = this.db.prepare(
+          `SELECT * FROM memories WHERE id IN (${placeholders})`,
+        ).all(...ids) as unknown as MemoryRow[];
+        for (const row of rows) idToRow.set(row.id, row);
+      }
     }
 
     const finalResults = merged
       .slice(0, limit)
       .filter(({ id }) => idToMemory.has(id))
-      .map(({ id, score }) => ({ memory: idToMemory.get(id)!, score }));
+      .map(({ id, score: rrfScore }) => {
+        const memory = idToMemory.get(id)!;
+        const result: SearchResult = { memory, score: rrfScore };
+        if (explain) {
+          const row = idToRow.get(id);
+          const { factor } = row
+            ? applyDecayWithFactor(row, 1)
+            : { factor: 1 };
+          const kwIdx = kwRank.get(id);
+          const semIdx = semRank.get(id);
+          result.explain = {
+            keyword: kwIdx !== undefined
+              ? { rank: kwIdx, bm25: kwRaw?.get(id) ?? 0 }
+              : null,
+            semantic: semIdx !== undefined
+              ? { rank: semIdx, cosine: semRaw?.get(id) ?? 0 }
+              : null,
+            rrfScore,
+            decayFactor: factor,
+            finalScore: rrfScore,
+          };
+        }
+        return result;
+      });
 
     // Touch access exactly once per final result
     for (const { memory } of finalResults) {
@@ -379,10 +447,36 @@ export class SqliteMemoryStore implements MemoryStore {
       for (const { memory } of fallback.slice(0, limit)) {
         this.touchAccessed(memory.id);
       }
-      return fallback.slice(0, limit);
+      return { results: fallback.slice(0, limit) };
     }
 
-    return finalResults;
+    const summary: ExplainSummary | undefined = explain
+      ? {
+          keywordCandidates: keywordResults.length,
+          semanticCandidates: semanticResults.length,
+          fusedCount: finalResults.length,
+          query: { fts: escapeFtsQuery(query) },
+        }
+      : undefined;
+
+    return { results: finalResults, summary };
+  }
+
+  /**
+   * Like search(), but when filters.explain is true (and mode === 'hybrid')
+   * returns a per-call ExplainSummary alongside the results.
+   * Only available on SqliteMemoryStore directly (not on MemoryStore interface).
+   */
+  async searchWithSummary(
+    query: string,
+    mode: SearchMode,
+    filters: SearchFilters,
+  ): Promise<{ results: SearchResult[]; summary?: ExplainSummary }> {
+    if (!filters.explain || mode !== 'hybrid') {
+      return { results: await this.search(query, mode, filters) };
+    }
+    const limit = filters.limit ?? 10;
+    return this._hybridSearchCore(query, filters, limit);
   }
 
   private applyFiltersAndDecay(

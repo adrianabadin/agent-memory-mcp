@@ -7,6 +7,7 @@ import {
   type SearchResult,
   type StoreRequest,
 } from './types.js';
+import type { SqliteMemoryStore } from './sqlite-store.js';
 import type { GlobalStore } from './global/global-store.js';
 
 // ── Zod schemas ────────────────────────────────────────────────────
@@ -78,16 +79,27 @@ export function handleSearch(store: MemoryStore) {
     after?: string;
     before?: string;
     limit?: number;
+    explain?: boolean;
   }): Promise<ReturnType<typeof success>> => {
     try {
       const mode = (args.mode ?? 'hybrid') as SearchMode;
-      const results = await store.search(args.query, mode, {
+      const filters = {
         category: args.category as StoreRequest['category'],
         tags: args.tags,
         after: args.after,
         before: args.before,
         limit: args.limit,
-      });
+        explain: args.explain,
+      };
+
+      if (args.explain && 'searchWithSummary' in store) {
+        const { results, summary } = await (store as SqliteMemoryStore).searchWithSummary(
+          args.query, mode, filters,
+        );
+        return success({ count: results.length, results, ...(summary ? { summary } : {}) });
+      }
+
+      const results = await store.search(args.query, mode, filters);
       return success({ count: results.length, results });
     } catch (err) {
       return error(`Search failed: ${String(err)}`);
@@ -337,6 +349,7 @@ export function registerTools(server: McpServer, store: MemoryStore, globalStore
       query: z.string().describe('What to search for — a concept, phrase, or question'),
       mode: modeSchema,
       ...filtersSchema,
+      explain: z.boolean().optional().describe('Debugging aid; adds per-stage scores (keyword rank/bm25, semantic rank/cosine, RRF score, decay factor) to each result. Hybrid mode only; ignored otherwise.'),
     },
     handleSearch(store),
   );
