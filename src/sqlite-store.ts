@@ -5,6 +5,7 @@ import type {
   ExplainSummary,
   Memory,
   MemoryCategory,
+  MemoryOrigin,
   MemoryStats,
   MemoryStore,
   PruneOptions,
@@ -46,7 +47,11 @@ CREATE TABLE IF NOT EXISTS memories (
   updated_at TEXT NOT NULL,
   access_count INTEGER NOT NULL DEFAULT 0,
   last_accessed_at TEXT NOT NULL,
-  version INTEGER NOT NULL DEFAULT 1
+  version INTEGER NOT NULL DEFAULT 1,
+  origin TEXT NOT NULL DEFAULT 'unknown',
+  source_tool TEXT,
+  session_id TEXT,
+  content_hash TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -89,12 +94,16 @@ interface MemoryRow {
   access_count: number;
   last_accessed_at: string;
   version: number;
+  origin?: string;
+  source_tool?: string | null;
+  session_id?: string | null;
+  content_hash?: string | null;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────
 
 function rowToMemory(row: MemoryRow): Memory {
-  return {
+  const memory: Memory = {
     id: row.id,
     content: row.content,
     category: row.category as MemoryCategory,
@@ -103,6 +112,16 @@ function rowToMemory(row: MemoryRow): Memory {
     updatedAt: row.updated_at,
     version: row.version ?? 1,
   };
+  const origin = (row.origin ?? 'unknown') as MemoryOrigin;
+  if (origin !== 'unknown' || row.source_tool || row.session_id || row.content_hash) {
+    memory.provenance = {
+      origin,
+      ...(row.source_tool ? { sourceTool: row.source_tool } : {}),
+      ...(row.session_id ? { sessionId: row.session_id } : {}),
+      ...(row.content_hash ? { contentHash: row.content_hash } : {}),
+    };
+  }
+  return memory;
 }
 
 function isEvergreen(row: MemoryRow): boolean {
@@ -143,6 +162,30 @@ export class SqliteMemoryStore implements MemoryStore {
   async initialize(): Promise<void> {
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec(SCHEMA_SQL);
+    this.runMigrations();
+  }
+
+  /**
+   * Idempotent schema migrations. Bump PRAGMA user_version after each successful
+   * migration so re-initialization is a no-op.
+   *
+   * v0 → v1: add provenance columns to `memories`.
+   */
+  private runMigrations(): void {
+    const current = (this.db.prepare('PRAGMA user_version').get() as { user_version: number } | undefined)?.user_version ?? 0;
+    if (current < 1) {
+      this.addColumnIfMissing('memories', 'origin', "TEXT NOT NULL DEFAULT 'unknown'");
+      this.addColumnIfMissing('memories', 'source_tool', 'TEXT');
+      this.addColumnIfMissing('memories', 'session_id', 'TEXT');
+      this.addColumnIfMissing('memories', 'content_hash', 'TEXT');
+      this.db.exec('PRAGMA user_version = 1');
+    }
+  }
+
+  private addColumnIfMissing(table: string, column: string, ddl: string): void {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    if (cols.some((c) => c.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
   }
 
   close(): void {
@@ -156,19 +199,28 @@ export class SqliteMemoryStore implements MemoryStore {
     const id = (request as any).id ?? randomUUID();
     const tags = JSON.stringify(request.tags ?? []);
     const embedding = await this.embedder.embed(request.content);
+    const provenance = request.provenance;
 
     this.db.exec('BEGIN');
     try {
       this.db.prepare(
         `INSERT INTO memories
-          (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version,
+           origin, source_tool, session_id, content_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            content        = excluded.content,
            category       = excluded.category,
            tags           = excluded.tags,
            updated_at     = excluded.updated_at`,
-      ).run(id, request.content, request.category, tags, now, now, 0, now, 1);
+      ).run(
+        id, request.content, request.category, tags, now, now, 0, now, 1,
+        provenance?.origin ?? 'unknown',
+        provenance?.sourceTool ?? null,
+        provenance?.sessionId ?? null,
+        provenance?.contentHash ?? null,
+      );
 
       this.db.prepare(
         `INSERT OR REPLACE INTO memory_embeddings (id, embedding) VALUES (?, ?)`,
@@ -188,6 +240,7 @@ export class SqliteMemoryStore implements MemoryStore {
       createdAt: now,
       updatedAt: now,
       version: 1,
+      ...(provenance ? { provenance } : {}),
     };
   }
 
@@ -213,17 +266,26 @@ export class SqliteMemoryStore implements MemoryStore {
         const accessCount = (m as any).access_count ?? 0;
         const lastAccessedAt = (m as any).last_accessed_at ?? now;
         const version = (m as any).version ?? 1;
+        const provenance = m.provenance;
 
         this.db.prepare(
           `INSERT INTO memories
-            (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version,
+             origin, source_tool, session_id, content_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              content        = excluded.content,
              category       = excluded.category,
              tags           = excluded.tags,
              updated_at     = excluded.updated_at`,
-        ).run(id, m.content, m.category, tags, createdAt, updatedAt, accessCount, lastAccessedAt, version);
+        ).run(
+          id, m.content, m.category, tags, createdAt, updatedAt, accessCount, lastAccessedAt, version,
+          provenance?.origin ?? 'unknown',
+          provenance?.sourceTool ?? null,
+          provenance?.sessionId ?? null,
+          provenance?.contentHash ?? null,
+        );
 
         this.db.prepare(
           `INSERT OR REPLACE INTO memory_embeddings (id, embedding) VALUES (?, ?)`,
@@ -237,6 +299,7 @@ export class SqliteMemoryStore implements MemoryStore {
           createdAt,
           updatedAt,
           version,
+          ...(provenance ? { provenance } : {}),
         });
       }
       this.db.exec('COMMIT');

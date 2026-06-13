@@ -109,6 +109,7 @@ export class MockMemoryStore implements MemoryStore {
       category: updates.category ?? existing.category,
       tags: updates.tags ?? existing.tags,
       updatedAt: new Date().toISOString(),
+      version: (existing.version ?? 1) + 1,
     };
     this.memories[index] = updated;
     return updated;
@@ -153,14 +154,19 @@ export class MockMemoryStore implements MemoryStore {
   // ── Helpers ──
 
   private buildMemory(request: StoreRequest): Memory {
-    return {
+    const memory: Memory = {
       id: crypto.randomUUID(),
       content: request.content,
       category: request.category,
       tags: [...request.tags],
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      version: 1,
     };
+    if (request.provenance) {
+      memory.provenance = { ...request.provenance };
+    }
+    return memory;
   }
 
   private applyFilters(memories: Memory[], filters: SearchFilters): Memory[] {

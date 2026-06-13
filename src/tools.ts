@@ -18,6 +18,14 @@ const categorySchema = z.enum(
 
 const tagsSchema = z.array(z.string()).describe('Free-form tags for organisation');
 
+const provenanceSchema = z.object({
+  origin: z.enum(['extracted', 'inferred', 'ambiguous', 'manual', 'unknown'])
+    .describe('How this memory was produced: deterministic extraction, LLM inference, manual, or unknown'),
+  sourceTool: z.string().optional().describe('Optional producing tool identifier (e.g. pmc-enrichment/ollama)'),
+  sessionId: z.string().optional().describe('Optional producer session or run identifier'),
+  contentHash: z.string().optional().describe('Optional content hash or source fragment hash for traceability'),
+}).optional().describe('Optional provenance metadata for trust and traceability');
+
 const filtersSchema = {
   category: categorySchema.optional().describe('Filter by category'),
   tags: z.array(z.string()).optional().describe('Filter: memory must have at least one of these tags'),
@@ -49,7 +57,7 @@ function error(message: string) {
 // an MCP server instance.
 
 export function handleStore(store: MemoryStore) {
-  return async (args: { content: string; category: string; tags: string[] }): Promise<ReturnType<typeof success>> => {
+  return async (args: { content: string; category: string; tags: string[]; provenance?: StoreRequest['provenance'] }): Promise<ReturnType<typeof success>> => {
     try {
       const memory = await store.store(args as StoreRequest);
       return success(memory);
@@ -60,7 +68,7 @@ export function handleStore(store: MemoryStore) {
 }
 
 export function handleStoreBatch(store: MemoryStore) {
-  return async (args: { memories: Array<{ content: string; category: string; tags: string[] }> }): Promise<ReturnType<typeof success>> => {
+  return async (args: { memories: Array<{ content: string; category: string; tags: string[]; provenance?: StoreRequest['provenance'] }> }): Promise<ReturnType<typeof success>> => {
     try {
       const memories = await store.storeBatch(args.memories as StoreRequest[]);
       return success({ stored: memories.length, memories });
@@ -323,6 +331,7 @@ export function registerTools(server: McpServer, store: MemoryStore, globalStore
       content: z.string().describe('The memory content — what you learnt, observed, or want to remember'),
       category: categorySchema.describe('Memory category'),
       tags: tagsSchema,
+      provenance: provenanceSchema,
     },
     handleStore(store),
   );
@@ -335,6 +344,7 @@ export function registerTools(server: McpServer, store: MemoryStore, globalStore
         content: z.string().describe('The memory content'),
         category: categorySchema,
         tags: tagsSchema,
+        provenance: provenanceSchema,
       })).describe('Array of memories to store'),
     },
     handleStoreBatch(store),

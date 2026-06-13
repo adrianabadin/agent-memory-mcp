@@ -19,6 +19,15 @@ export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 
 // ── Domain objects ─────────────────────────────────────────────────
 
+export type MemoryOrigin = 'extracted' | 'inferred' | 'ambiguous' | 'manual' | 'unknown';
+
+export interface MemoryProvenance {
+  origin: MemoryOrigin;
+  sourceTool?: string;
+  sessionId?: string;
+  contentHash?: string;
+}
+
 export interface Memory {
   id: string;
   content: string;
@@ -27,6 +36,7 @@ export interface Memory {
   createdAt: string;
   updatedAt: string;
   version: number;
+  provenance?: MemoryProvenance;
 }
 
 export interface ExplainPayload {
@@ -81,6 +91,7 @@ export interface StoreRequest {
   content: string;
   category: MemoryCategory;
   tags: string[];
+  provenance?: MemoryProvenance;
 }
 
 export interface UpdateRequest {
