@@ -2,8 +2,15 @@ import { TransformersEmbedder } from './embedder.js';
 import { EmbeddingCache } from './embedding-cache.js';
 import { createStore } from './store-factory.js';
 import { createGlobalStore } from './global/global-factory.js';
-import type { Embedder, MemoryStore } from './types.js';
+import type {
+  Embedder,
+  MemoryStore,
+  SessionPrompt,
+  SessionResponse,
+  SessionToolCall,
+} from './types.js';
 import type { GlobalStore } from './global/global-store.js';
+import { SqliteMemoryStore } from './sqlite-store.js';
 
 // Re-export the composition primitives so consumers (the unified `pmc` server)
 // can import everything they need from a single side-effect-free entry point,
@@ -121,4 +128,96 @@ export async function buildMemoryComponents(options: {
   const globalStore = await createGlobalStore(embedder);
 
   return { store, globalStore, embedder };
+}
+
+// ── Ledger-only store (session-capture drainer) ──────────────────────
+
+/**
+ * The session-ledger surface exposed to the capture-pipeline drainer.
+ *
+ * The drainer only needs to append session prompts / responses / tool calls
+ * and manage the in-memory session context. It must NOT touch the memory
+ * store/search tables (store, storeBatch, search, findRelated, listRecent,
+ * update, delete, stats, prune) so a runaway drainer cannot fragment the
+ * memory data. This interface statically enforces that boundary: callers get
+ * exactly the session-ledger methods plus lifecycle (`initialize` / `close`)
+ * and nothing else.
+ */
+export interface LedgerStore {
+  /** Open the database and run idempotent schema migrations. */
+  initialize(): Promise<void>;
+  /** Close the underlying SQLite handle (idempotent; safe to call repeatedly). */
+  close(): void;
+
+  /** Append a raw prompt to the session ledger. */
+  storeSessionPrompt(sessionId: string, rawPrompt: string): Promise<SessionPrompt>;
+  /** Append an assistant response linked to a prompt. */
+  storeSessionResponse(sessionId: string, promptId: string, fullResponse: string): Promise<SessionResponse>;
+  /** Append a tool-call record to the session ledger. */
+  storeSessionToolCall(params: {
+    sessionId: string;
+    promptId?: string;
+    responseId?: string;
+    toolName: string;
+    argsSafe?: string;
+    resultSummary?: string;
+    importance?: string;
+  }): Promise<SessionToolCall>;
+  /** Set the active session context (in-memory; not persisted). */
+  setSessionContext(sessionId: string, projectId: string): void;
+  /** Read the active session context, or null when none is set. */
+  getSessionContext(): { sessionId: string; projectId: string } | null;
+}
+
+/**
+ * No-op embedder used by {@link createLedgerOnlyStore}. The session-ledger
+ * write path calls `embedder.embed(...)` for every row, but the drainer does
+ * not need real vectors (the capture pipeline never runs semantic search on
+ * raw session items directly). Returning an empty vector avoids the embedding
+ * model download entirely, so the drainer boots instantly.
+ */
+const dummyEmbedder: Embedder = {
+  initialize: async () => {},
+  embed: async () => [],
+  embedBatch: async () => [],
+  dimensions: () => 1024,
+};
+
+/**
+ * Build a ledger-only store over `SqliteMemoryStore` for the session-capture
+ * drainer.
+ *
+ * The drainer writes session-ledger rows (prompts / responses / tool calls)
+ * directly to the project memory database without going through the MCP server
+ * and without loading the embedding model. It reuses the canonical
+ * `SqliteMemoryStore` ledger implementation (no schema drift) but is typed as
+ * {@link LedgerStore} so only the session surface is reachable.
+ *
+ * The returned handle:
+ *   - is already initialized (schema + migrations applied);
+ *   - has `PRAGMA busy_timeout = 5000` set, so transient WAL lock contention
+ *     from the main agent process retries for up to 5s instead of failing
+ *     immediately (capture-pipeline R2);
+ *   - uses the path convention `${dbPath}.db` to match the main store.
+ *
+ * Callers MUST `close()` the store when the drainer exits to release the file
+ * lock.
+ *
+ * @param dbPath Base path for the memory SQLite DB (the `.db` suffix is appended).
+ * @returns An initialized, ledger-only handle over the shared memory database.
+ */
+export async function createLedgerOnlyStore(dbPath: string): Promise<LedgerStore> {
+  // Match the path convention used by the main store: append `.db`.
+  const sqlitePath = `${dbPath}.db`;
+  const store = new SqliteMemoryStore(sqlitePath, dummyEmbedder);
+  await store.initialize();
+
+  // Enforce a 5s busy_timeout so the drainer survives transient lock
+  // contention with the main agent process (capture-pipeline R2). The PRAGMA
+  // is set after initialize() so it applies to the already-opened handle.
+  store.getDb().exec('PRAGMA busy_timeout = 5000');
+
+  // Expose only the session-ledger surface; the memory store/search methods
+  // remain on the underlying object but are invisible through this type.
+  return store as unknown as LedgerStore;
 }
