@@ -110,7 +110,7 @@ describe('schema v3 migration: lifecycle columns on session tables', () => {
 
     const db = new DatabaseSync(dbPath);
     const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-    expect(version).toBe(4);
+    expect(version).toBe(5);
 
     // Prompt row: defaults backfilled from created_at
     const p = db.prepare(`SELECT * FROM session_prompts WHERE id = 'leg-p1'`).get() as Record<string, unknown>;
@@ -150,7 +150,7 @@ describe('schema v3 migration: lifecycle columns on session tables', () => {
 
     const db = new DatabaseSync(dbPath);
     const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-    expect(version).toBe(4);
+    expect(version).toBe(5);
     // Row still present and intact after two migrations
     const p = db.prepare(`SELECT raw_prompt, status FROM session_prompts WHERE id = 'leg-p1'`).get() as any;
     expect(p.raw_prompt).toBe('legacy prompt');
@@ -170,7 +170,7 @@ describe('schema v3 migration: lifecycle columns on session tables', () => {
 
     const db = new DatabaseSync(dbPath);
     const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-    expect(version).toBe(4);
+    expect(version).toBe(5);
 
     const cols = (tbl: string) =>
       (db.prepare(`PRAGMA table_info(${tbl})`).all() as { name: string }[]).map(c => c.name);

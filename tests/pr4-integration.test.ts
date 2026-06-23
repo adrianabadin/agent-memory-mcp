@@ -758,7 +758,7 @@ describe('T-008: migration v2 final verification', () => {
     const db = env.rawDb();
     const row = db.prepare('PRAGMA user_version').get() as { user_version: number };
     db.close();
-    expect(row.user_version).toBe(4);
+    expect(row.user_version).toBe(5);
   });
 
   it('data round-trips through every new table', async () => {

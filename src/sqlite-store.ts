@@ -702,6 +702,54 @@ export class SqliteMemoryStore implements MemoryStore {
 
       this.db.exec('PRAGMA user_version = 4');
     }
+
+    // ── v5: Global promotion & audit trail ──
+    if (current < 5) {
+      this.addColumnIfMissing('memories', 'non_forgettable', 'INTEGER NOT NULL DEFAULT 0');
+
+      // memory_revive_reviews: tracks revive decisions for revival-based promotion
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_revive_reviews (
+          id TEXT PRIMARY KEY,
+          memory_id TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          reason TEXT,
+          model TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_revive_reviews_memory_id ON memory_revive_reviews(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_revive_reviews_decision ON memory_revive_reviews(decision);
+      `);
+
+      // global_promotion_log: immutable audit trail for promotions
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS global_promotion_log (
+          id TEXT PRIMARY KEY,
+          promoted_memory_id TEXT NOT NULL,
+          source_ids TEXT NOT NULL,
+          source_projects TEXT NOT NULL,
+          rule_matched TEXT NOT NULL,
+          confidence REAL NOT NULL,
+          model TEXT,
+          reviewer_provenance TEXT,
+          created_at TEXT NOT NULL,
+          UNIQUE(promoted_memory_id, source_ids)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gpl_promoted_memory_id ON global_promotion_log(promoted_memory_id);
+        CREATE INDEX IF NOT EXISTS idx_gpl_source_projects ON global_promotion_log(source_projects);
+        CREATE INDEX IF NOT EXISTS idx_gpl_rule_matched ON global_promotion_log(rule_matched);
+      `);
+
+      this.db.exec('PRAGMA user_version = 5');
+    }
+  }
+
+  /**
+   * Expose the raw database handle for modules that need direct access
+   * (e.g., PromotionRuleEngine).
+   */
+  getDb(): DatabaseSync {
+    return this.db;
   }
 
   private addColumnIfMissing(table: string, column: string, ddl: string): void {
