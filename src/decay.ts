@@ -244,3 +244,167 @@ export function transitionDecayState(
   }
   return result;
 }
+
+// ── Reinforcement (PR 2b) ──────────────────────────────────────────
+
+/** Score boost applied when a deep-stage (shadow/gist_only) memory is accessed. */
+export const REINFORCEMENT_SCORE_BOOST = 0.7;
+
+/** Maximum score a reinforced memory can reach without full state revert. */
+export const REINFORCED_SCORE_CAP = 0.95;
+
+export interface ReinforcementInput {
+  memoryId: string;
+  currentState: DecayState;
+  activationScore: number;
+  config: ForgettingConfig;
+  /** Epoch ms; injectable for deterministic tests. Defaults to Date.now(). */
+  now?: number;
+}
+
+export interface ReinforcementResult {
+  newState: DecayState;
+  newScore: number;
+  /** True when state reverted (cooling/dimmed → active). */
+  transitioned: boolean;
+  /** True when active access was a no-op (no log should be emitted). */
+  silent: boolean;
+  reason: string;
+}
+
+export interface ReinforcementLogRecord {
+  memory_id: string;
+  from_state: DecayState;
+  to_state: DecayState;
+  reason: string;
+  score_before: number;
+  score_after: number;
+}
+
+/** Injected by the store to persist a reinforcement record into `memory_decay_log`. */
+export type ReinforcementLogWriter = (record: ReinforcementLogRecord) => void;
+
+/**
+ * Pure decision core for memory reinforcement on access.
+ *
+ * Rules:
+ *   • active → silent no-op (score stays 1.0, no log)
+ *   • purged → no-op (score stays 0.0)
+ *   • cooling / dimmed → revert to active (score = 1.0)
+ *   • shadow / gist_only → keep state, boost score by REINFORCEMENT_SCORE_BOOST
+ *     (capped at REINFORCED_SCORE_CAP = 0.95)
+ */
+export function reinforceMemory(
+  input: ReinforcementInput,
+  writeLog?: ReinforcementLogWriter,
+): ReinforcementResult {
+  const { currentState, activationScore } = input;
+
+  // Active: silent no-op
+  if (currentState === 'active') {
+    return {
+      newState: 'active',
+      newScore: 1.0,
+      transitioned: false,
+      silent: true,
+      reason: 'already active; no reinforcement needed',
+    };
+  }
+
+  // Purged: no-op
+  if (currentState === 'purged') {
+    return {
+      newState: 'purged',
+      newScore: 0.0,
+      transitioned: false,
+      silent: true,
+      reason: 'purged memories cannot be reinforced',
+    };
+  }
+
+  // Cooling / dimmed: revert to active
+  if (currentState === 'cooling' || currentState === 'dimmed') {
+    const result: ReinforcementResult = {
+      newState: 'active',
+      newScore: 1.0,
+      transitioned: true,
+      silent: false,
+      reason: `reinforced from ${currentState} back to active`,
+    };
+    if (writeLog) {
+      writeLog({
+        memory_id: input.memoryId,
+        from_state: currentState,
+        to_state: 'active',
+        reason: result.reason,
+        score_before: activationScore,
+        score_after: 1.0,
+      });
+    }
+    return result;
+  }
+
+  // Shadow / gist_only: keep state, boost score
+  const boosted = Math.min(activationScore + REINFORCEMENT_SCORE_BOOST, REINFORCED_SCORE_CAP);
+  const result: ReinforcementResult = {
+    newState: currentState,
+    newScore: boosted,
+    transitioned: false,
+    silent: false,
+    reason: `reinforced in ${currentState}; score ${activationScore.toFixed(2)} → ${boosted.toFixed(2)}`,
+  };
+  if (writeLog) {
+    writeLog({
+      memory_id: input.memoryId,
+      from_state: currentState,
+      to_state: currentState,
+      reason: result.reason,
+      score_before: activationScore,
+      score_after: boosted,
+    });
+  }
+  return result;
+}
+
+// ── Batch decay evaluation (PR 2b) ─────────────────────────────────
+
+export interface DecayBatchInput {
+  memoryId: string;
+  currentState: DecayState;
+  lastReinforcedAt: string;
+  activationScore: number;
+}
+
+export interface DecayBatchResult {
+  processed: number;
+  transitioned: number;
+  results: Array<{ memoryId: string; result: DecayTransitionResult }>;
+}
+
+/**
+ * Pure batch aggregation: evaluate a collection of memories for decay transitions.
+ * The store fetches rows and calls this, then persists all transitions in one
+ * atomic transaction.
+ */
+export function evaluateDecayBatch(
+  memories: DecayBatchInput[],
+  config: ForgettingConfig,
+  now: number = Date.now(),
+): DecayBatchResult {
+  const results: Array<{ memoryId: string; result: DecayTransitionResult }> = [];
+  let transitioned = 0;
+
+  for (const mem of memories) {
+    const result = computeDecayTransition({
+      memoryId: mem.memoryId,
+      currentState: mem.currentState,
+      lastReinforcedAt: mem.lastReinforcedAt,
+      config,
+      now,
+    });
+    if (result.transitioned) transitioned++;
+    results.push({ memoryId: mem.memoryId, result });
+  }
+
+  return { processed: memories.length, transitioned, results };
+}

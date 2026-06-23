@@ -8,10 +8,12 @@ import { MockEmbedder } from './mocks.js';
 import {
   evaluateActivationScore,
   transitionDecayState,
+  reinforceMemory,
+  evaluateDecayBatch,
   DEFAULT_FORGETTING_CONFIG,
   DECAY_STAGE_ORDER,
 } from '../src/decay.js';
-import type { ForgettingConfig, DecayState } from '../src/decay.js';
+import type { ForgettingConfig, DecayState, ReinforcementResult, DecayBatchResult } from '../src/decay.js';
 import { MemoryNotFoundError } from '../src/errors.js';
 
 const MS_PER_DAY = 86_400_000;
@@ -372,5 +374,354 @@ describe('SqliteMemoryStore.transitionDecayStateForMemory', () => {
 
     const result = store.transitionDecayStateForMemory(mem.id, DEFAULT_FORGETTING_CONFIG);
     expect(result.newState).toBe('dimmed');
+  });
+});
+
+// ── PR 2b: Reinforcement & Batch Evaluation ───────────────────────
+
+// ── reinforceMemory (pure logic) ────────────────────────────────────
+
+describe('reinforceMemory (pure logic)', () => {
+  const cfg: ForgettingConfig = DEFAULT_FORGETTING_CONFIG;
+  const now = Date.now();
+
+  function reinforce(currentState: DecayState, activationScore: number) {
+    return reinforceMemory({
+      memoryId: 'm1',
+      currentState,
+      activationScore,
+      config: cfg,
+      now,
+    });
+  }
+
+  it('reverts cooling → active', () => {
+    const r = reinforce('cooling', 0.8);
+    expect(r.newState).toBe('active');
+    expect(r.transitioned).toBe(true);
+    expect(r.newScore).toBe(1.0);
+  });
+
+  it('reverts dimmed → active', () => {
+    const r = reinforce('dimmed', 0.6);
+    expect(r.newState).toBe('active');
+    expect(r.transitioned).toBe(true);
+    expect(r.newScore).toBe(1.0);
+  });
+
+  it('keeps shadow state but boosts score toward active', () => {
+    const r = reinforce('shadow', 0.4);
+    expect(r.newState).toBe('shadow');
+    expect(r.transitioned).toBe(false);
+    expect(r.newScore).toBeGreaterThan(0.4);
+    expect(r.newScore).toBeLessThanOrEqual(0.95);
+  });
+
+  it('keeps gist_only state but boosts score toward active', () => {
+    const r = reinforce('gist_only', 0.2);
+    expect(r.newState).toBe('gist_only');
+    expect(r.transitioned).toBe(false);
+    expect(r.newScore).toBeGreaterThan(0.2);
+    expect(r.newScore).toBeLessThanOrEqual(0.95);
+  });
+
+  it('active access is a silent no-op (no state change)', () => {
+    const r = reinforce('active', 1.0);
+    expect(r.newState).toBe('active');
+    expect(r.transitioned).toBe(false);
+    expect(r.newScore).toBe(1.0);
+    expect(r.silent).toBe(true);
+  });
+
+  it('purged is a no-op', () => {
+    const r = reinforce('purged', 0.0);
+    expect(r.newState).toBe('purged');
+    expect(r.transitioned).toBe(false);
+    expect(r.newScore).toBe(0.0);
+    expect(r.silent).toBe(true);
+  });
+
+  it('boost caps at 0.95 for deep stages', () => {
+    const r = reinforce('shadow', 0.85);
+    expect(r.newScore).toBeLessThanOrEqual(0.95);
+  });
+
+  it('score boost is REINFORCEMENT_SCORE_BOOST (0.7) applied', () => {
+    const r = reinforce('shadow', 0.4);
+    // 0.4 + 0.7 = 1.1, capped at 0.95
+    expect(r.newScore).toBeCloseTo(0.95, 5);
+  });
+
+  it('logs the reinforcement only when state/score changes', () => {
+    const recorded: any[] = [];
+    reinforceMemory(
+      { memoryId: 'm1', currentState: 'cooling', activationScore: 0.8, config: cfg, now },
+      (rec) => recorded.push(rec),
+    );
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].from_state).toBe('cooling');
+    expect(recorded[0].to_state).toBe('active');
+  });
+
+  it('does NOT log when active access is silent', () => {
+    let calls = 0;
+    reinforceMemory(
+      { memoryId: 'm1', currentState: 'active', activationScore: 1.0, config: cfg, now },
+      () => calls++,
+    );
+    expect(calls).toBe(0);
+  });
+});
+
+// ── Store reinforceMemory ────────────────────────────────────────────
+
+describe('SqliteMemoryStore.reinforceMemory', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let verify: DatabaseSync;
+
+  beforeEach(async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'reinforce-'));
+    dbPath = join(tmpDir, 'test.db');
+    const embedder = new MockEmbedder();
+    store = new SqliteMemoryStore(dbPath, embedder);
+    await store.initialize();
+    verify = new DatabaseSync(dbPath);
+  });
+
+  afterEach(async () => {
+    verify.close();
+    store.close();
+    await rm(join(dbPath, '..'), { recursive: true, force: true });
+  });
+
+  it('resets last_reinforced_at on access', async () => {
+    const mem = await store.store({ content: 'reinforce timer', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 50 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ?, memory_state = ? WHERE id = ?').run(old, 'cooling', mem.id);
+
+    store.reinforceMemory(mem.id);
+
+    const row = verify.prepare('SELECT last_reinforced_at FROM memories WHERE id = ?').get(mem.id) as { last_reinforced_at: string };
+    const reinforcedAt = new Date(row.last_reinforced_at).getTime();
+    expect(Date.now() - reinforcedAt).toBeLessThan(5000); // within 5 seconds
+  });
+
+  it('reverts cooling → active and logs the transition', async () => {
+    const mem = await store.store({ content: 'reinforce revert', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 50 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ?, memory_state = ?, activation_score = ? WHERE id = ?').run(old, 'cooling', 0.8, mem.id);
+
+    store.reinforceMemory(mem.id);
+
+    const row = verify.prepare('SELECT memory_state, activation_score FROM memories WHERE id = ?').get(mem.id) as { memory_state: string; activation_score: number };
+    expect(row.memory_state).toBe('active');
+    expect(row.activation_score).toBe(1.0);
+
+    const logs = verify.prepare('SELECT from_state, to_state FROM memory_decay_log WHERE memory_id = ?').all(mem.id) as { from_state: string; to_state: string }[];
+    expect(logs.some(l => l.from_state === 'cooling' && l.to_state === 'active')).toBe(true);
+  });
+
+  it('boosts shadow score but keeps state', async () => {
+    const mem = await store.store({ content: 'reinforce boost', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 400 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ?, memory_state = ?, activation_score = ? WHERE id = ?').run(old, 'shadow', 0.4, mem.id);
+
+    store.reinforceMemory(mem.id);
+
+    const row = verify.prepare('SELECT memory_state, activation_score FROM memories WHERE id = ?').get(mem.id) as { memory_state: string; activation_score: number };
+    expect(row.memory_state).toBe('shadow');
+    expect(row.activation_score).toBeGreaterThan(0.4);
+  });
+
+  it('gist_only → 0.9 score boost', async () => {
+    const mem = await store.store({ content: 'gist boost', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 700 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ?, memory_state = ?, activation_score = ? WHERE id = ?').run(old, 'gist_only', 0.2, mem.id);
+
+    store.reinforceMemory(mem.id);
+
+    const row = verify.prepare('SELECT memory_state, activation_score FROM memories WHERE id = ?').get(mem.id) as { memory_state: string; activation_score: number };
+    expect(row.memory_state).toBe('gist_only');
+    expect(row.activation_score).toBeCloseTo(0.9, 5);
+  });
+
+  it('active access is silent — no log entry', async () => {
+    const mem = await store.store({ content: 'active silent', category: 'learning', tags: [] });
+    const countBefore = (verify.prepare('SELECT COUNT(*) AS n FROM memory_decay_log').get() as { n: number }).n;
+
+    store.reinforceMemory(mem.id);
+
+    const countAfter = (verify.prepare('SELECT COUNT(*) AS n FROM memory_decay_log').get() as { n: number }).n;
+    expect(countAfter).toBe(countBefore);
+  });
+
+  it('throws MemoryNotFoundError for nonexistent id', () => {
+    expect(() => store.reinforceMemory('nonexistent')).toThrow(MemoryNotFoundError);
+  });
+});
+
+// ── Batch decay evaluation ──────────────────────────────────────────
+
+describe('evaluateDecayBatch (pure logic)', () => {
+  const cfg: ForgettingConfig = DEFAULT_FORGETTING_CONFIG;
+  const now = Date.now();
+  const iso = (daysAgo: number) => new Date(now - daysAgo * MS_PER_DAY).toISOString();
+
+  it('transitions memories that cross a stage boundary', () => {
+    const memories = [
+      { memoryId: 'm1', currentState: 'active' as DecayState, lastReinforcedAt: iso(35), activationScore: 1.0 },
+      { memoryId: 'm2', currentState: 'active' as DecayState, lastReinforcedAt: iso(10), activationScore: 1.0 },
+    ];
+    const result = evaluateDecayBatch(memories, cfg, now);
+    expect(result.processed).toBe(2);
+    expect(result.transitioned).toBe(1); // only m1
+    expect(result.results[0].result.newState).toBe('cooling');
+    expect(result.results[1].result.transitioned).toBe(false);
+  });
+
+  it('only processes memories past the stage boundary', () => {
+    const memories = [
+      { memoryId: 'm1', currentState: 'active' as DecayState, lastReinforcedAt: iso(29), activationScore: 1.0 },
+      { memoryId: 'm2', currentState: 'active' as DecayState, lastReinforcedAt: iso(31), activationScore: 1.0 },
+    ];
+    const result = evaluateDecayBatch(memories, cfg, now);
+    expect(result.transitioned).toBe(1);
+    expect(result.results.find(r => r.memoryId === 'm1')!.result.transitioned).toBe(false);
+    expect(result.results.find(r => r.memoryId === 'm2')!.result.transitioned).toBe(true);
+  });
+
+  it('handles empty batch', () => {
+    const result = evaluateDecayBatch([], cfg, now);
+    expect(result.processed).toBe(0);
+    expect(result.transitioned).toBe(0);
+  });
+});
+
+describe('SqliteMemoryStore.evaluateAllMemoriesForDecay', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let verify: DatabaseSync;
+
+  beforeEach(async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'batch-decay-'));
+    dbPath = join(tmpDir, 'test.db');
+    const embedder = new MockEmbedder();
+    store = new SqliteMemoryStore(dbPath, embedder);
+    await store.initialize();
+    verify = new DatabaseSync(dbPath);
+  });
+
+  afterEach(async () => {
+    verify.close();
+    store.close();
+    await rm(join(dbPath, '..'), { recursive: true, force: true });
+  });
+
+  it('processes all non-purged memories and transitions those ready', async () => {
+    // m1: 35 days old → should transition to cooling
+    const m1 = await store.store({ content: 'batch 1', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 35 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ? WHERE id = ?').run(old, m1.id);
+
+    // m2: 5 days old → stays active
+    const m2 = await store.store({ content: 'batch 2', category: 'learning', tags: [] });
+
+    const result = store.evaluateAllMemoriesForDecay(DEFAULT_FORGETTING_CONFIG);
+    expect(result.processed).toBe(2);
+    expect(result.transitioned).toBe(1);
+
+    // Verify m1 transitioned
+    const row = verify.prepare('SELECT memory_state FROM memories WHERE id = ?').get(m1.id) as { memory_state: string };
+    expect(row.memory_state).toBe('cooling');
+  });
+
+  it('excludes purged memories from processing', async () => {
+    const mem = await store.store({ content: 'purged skip', category: 'learning', tags: [] });
+    verify.prepare("UPDATE memories SET memory_state = 'purged' WHERE id = ?").run(mem.id);
+
+    const result = store.evaluateAllMemoriesForDecay(DEFAULT_FORGETTING_CONFIG);
+    expect(result.processed).toBe(0);
+  });
+
+  it('inserts decay log entries for each transition', async () => {
+    const mem = await store.store({ content: 'log check', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 121 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ? WHERE id = ?').run(old, mem.id);
+
+    store.evaluateAllMemoriesForDecay(DEFAULT_FORGETTING_CONFIG);
+
+    const logs = verify.prepare('SELECT from_state, to_state FROM memory_decay_log WHERE memory_id = ?').all(mem.id) as { from_state: string; to_state: string }[];
+    expect(logs.length).toBeGreaterThan(0);
+    expect(logs[0].from_state).toBe('active');
+    expect(logs[0].to_state).toBe('dimmed');
+  });
+
+  it('commits atomically — all transitions persist', async () => {
+    const m1 = await store.store({ content: 'atom 1', category: 'learning', tags: [] });
+    const m2 = await store.store({ content: 'atom 2', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 35 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ? WHERE id IN (?,?)').run(old, m1.id, m2.id);
+
+    store.evaluateAllMemoriesForDecay(DEFAULT_FORGETTING_CONFIG);
+
+    const r1 = verify.prepare('SELECT memory_state FROM memories WHERE id = ?').get(m1.id) as { memory_state: string };
+    const r2 = verify.prepare('SELECT memory_state FROM memories WHERE id = ?').get(m2.id) as { memory_state: string };
+    expect(r1.memory_state).toBe('cooling');
+    expect(r2.memory_state).toBe('cooling');
+  });
+});
+
+// ── Decay multiplier integration ────────────────────────────────────
+
+describe('activationMultiplier in search', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let verify: DatabaseSync;
+
+  beforeEach(async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'decay-mult-'));
+    dbPath = join(tmpDir, 'test.db');
+    const embedder = new MockEmbedder();
+    store = new SqliteMemoryStore(dbPath, embedder);
+    await store.initialize();
+    verify = new DatabaseSync(dbPath);
+  });
+
+  afterEach(async () => {
+    verify.close();
+    store.close();
+    await rm(join(dbPath, '..'), { recursive: true, force: true });
+  });
+
+  it('decayed memories rank lower than fresh ones with same base score', async () => {
+    // Both memories have the same content so they get the same base score.
+    const fresh = await store.store({ content: 'ranking test alpha', category: 'learning', tags: [] });
+    const stale = await store.store({ content: 'ranking test alpha', category: 'learning', tags: [] });
+    // Make stale memory old with low activation_score
+    const old = new Date(Date.now() - 200 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ?, memory_state = ?, activation_score = ? WHERE id = ?').run(old, 'dimmed', 0.6, stale.id);
+
+    const results = await store.search('ranking test', 'hybrid', { limit: 10 });
+    const freshIdx = results.findIndex(r => r.memory.id === fresh.id);
+    const staleIdx = results.findIndex(r => r.memory.id === stale.id);
+
+    // Both should be found, but fresh should rank higher
+    expect(freshIdx).toBeGreaterThanOrEqual(0);
+    expect(staleIdx).toBeGreaterThanOrEqual(0);
+    expect(freshIdx).toBeLessThan(staleIdx);
+  });
+
+  it('search reinforces returned memories', async () => {
+    const mem = await store.store({ content: 'reinforce on search', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 50 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ?, memory_state = ? WHERE id = ?').run(old, 'cooling', mem.id);
+
+    await store.search('reinforce search', 'hybrid', { limit: 10 });
+
+    const row = verify.prepare('SELECT memory_state, last_reinforced_at FROM memories WHERE id = ?').get(mem.id) as { memory_state: string; last_reinforced_at: string };
+    expect(row.memory_state).toBe('active');
+    const reinforcedAt = new Date(row.last_reinforced_at).getTime();
+    expect(Date.now() - reinforcedAt).toBeLessThan(5000);
   });
 });

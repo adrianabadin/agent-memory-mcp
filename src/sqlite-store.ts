@@ -45,12 +45,17 @@ import {
   importanceMultiplier,
   EVERGREEN_TAGS,
   transitionDecayState,
+  reinforceMemory,
+  evaluateDecayBatch,
+  evaluateActivationScore,
   DEFAULT_FORGETTING_CONFIG,
 } from './decay.js';
 import type {
   ForgettingConfig,
   DecayState,
   DecayTransitionResult,
+  ReinforcementResult,
+  DecayBatchResult,
 } from './decay.js';
 import {
   embeddingToBlob,
@@ -185,13 +190,17 @@ const MS_PER_DAY = 86_400_000;
 function applyDecay(row: MemoryRow, rawScore: number): number {
   if (DECAY_HALF_LIFE_DAYS <= 0 || isEvergreen(row)) return rawScore;
   const effectiveHalfLife = DECAY_HALF_LIFE_DAYS * importanceMultiplier(row as unknown as Record<string, unknown>);
-  return rawScore * computeDecayFactor(row.updated_at, effectiveHalfLife);
+  const temporalFactor = computeDecayFactor(row.updated_at, effectiveHalfLife);
+  const activationFactor = row.activation_score ?? 1.0;
+  return rawScore * temporalFactor * activationFactor;
 }
 
 function applyDecayWithFactor(row: MemoryRow, rawScore: number): { score: number; factor: number } {
   if (DECAY_HALF_LIFE_DAYS <= 0 || isEvergreen(row)) return { score: rawScore, factor: 1 };
   const effectiveHalfLife = DECAY_HALF_LIFE_DAYS * importanceMultiplier(row as unknown as Record<string, unknown>);
-  const factor = computeDecayFactor(row.updated_at, effectiveHalfLife);
+  const temporalFactor = computeDecayFactor(row.updated_at, effectiveHalfLife);
+  const activationFactor = row.activation_score ?? 1.0;
+  const factor = temporalFactor * activationFactor;
   return { score: rawScore * factor, factor };
 }
 
@@ -758,6 +767,126 @@ export class SqliteMemoryStore implements MemoryStore {
     return result;
   }
 
+  /**
+   * Reinforce a memory on access: resets `last_reinforced_at`, reverts
+   * cooling/dimmed to active, boosts score for deep stages (shadow/gist_only).
+   * Logs reinforcement only when state/score actually changes (silent for
+   * active accesses).
+   */
+  reinforceMemory(memoryId: string): ReinforcementResult {
+    const row = this.db.prepare(
+      'SELECT memory_state, activation_score, last_reinforced_at, created_at FROM memories WHERE id = ?',
+    ).get(memoryId) as {
+      memory_state: string;
+      activation_score: number;
+      last_reinforced_at: string | null;
+      created_at: string;
+    } | undefined;
+
+    if (!row) throw new MemoryNotFoundError(memoryId);
+
+    const currentState = (row.memory_state ?? 'active') as DecayState;
+    const activationScore = row.activation_score ?? 1.0;
+
+    const result = reinforceMemory(
+      {
+        memoryId,
+        currentState,
+        activationScore,
+        config: DEFAULT_FORGETTING_CONFIG,
+      },
+      (record) => {
+        this.db.prepare(
+          `INSERT INTO memory_decay_log (id, memory_id, from_state, to_state, reason, score_before, score_after, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          randomUUID(), record.memory_id, record.from_state, record.to_state,
+          record.reason, record.score_before, record.score_after, new Date().toISOString(),
+        );
+      },
+    );
+
+    // Always reset last_reinforced_at on reinforcement (even for silent active accesses).
+    const now = new Date().toISOString();
+    if (result.transitioned) {
+      // Full revert: update state, score, and timer.
+      this.db.prepare(
+        'UPDATE memories SET memory_state = ?, activation_score = ?, last_reinforced_at = ? WHERE id = ?',
+      ).run(result.newState, result.newScore, now, memoryId);
+    } else if (!result.silent) {
+      // Score boost only (shadow/gist_only): update score and timer, keep state.
+      this.db.prepare(
+        'UPDATE memories SET activation_score = ?, last_reinforced_at = ? WHERE id = ?',
+      ).run(result.newScore, now, memoryId);
+    } else {
+      // Silent active access: reset timer only.
+      this.db.prepare(
+        'UPDATE memories SET last_reinforced_at = ? WHERE id = ?',
+      ).run(now, memoryId);
+    }
+
+    return result;
+  }
+
+  /**
+   * Batch decay evaluation for scheduled maintenance (sleep mode).
+   * Fetches all non-purged memories, evaluates each for decay transitions,
+   * and persists all transitions in one atomic transaction with ROLLBACK on error.
+   */
+  evaluateAllMemoriesForDecay(config?: ForgettingConfig): DecayBatchResult {
+    const cfg = config ?? DEFAULT_FORGETTING_CONFIG;
+
+    const rows = this.db.prepare(
+      `SELECT id, memory_state, last_reinforced_at, created_at, activation_score
+       FROM memories WHERE memory_state != 'purged'`,
+    ).all() as Array<{
+      id: string;
+      memory_state: string;
+      last_reinforced_at: string | null;
+      created_at: string;
+      activation_score: number;
+    }>;
+
+    const batchInput = rows.map(r => ({
+      memoryId: r.id,
+      currentState: (r.memory_state ?? 'active') as DecayState,
+      lastReinforcedAt: r.last_reinforced_at ?? r.created_at,
+      activationScore: r.activation_score ?? 1.0,
+    }));
+
+    const batchResult = evaluateDecayBatch(batchInput, cfg);
+
+    // Persist all transitions in one atomic transaction.
+    this.db.exec('BEGIN');
+    try {
+      for (const { memoryId, result } of batchResult.results) {
+        if (!result.transitioned) continue;
+        // Log the transition
+        this.db.prepare(
+          `INSERT INTO memory_decay_log (id, memory_id, from_state, to_state, reason, score_before, score_after, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          randomUUID(), memoryId,
+          batchInput.find(m => m.memoryId === memoryId)!.currentState,
+          result.newState, result.reason,
+          evaluateActivationScore(batchInput.find(m => m.memoryId === memoryId)!.currentState),
+          result.newScore,
+          new Date().toISOString(),
+        );
+        // Update the memory row
+        this.db.prepare(
+          'UPDATE memories SET memory_state = ?, activation_score = ? WHERE id = ?',
+        ).run(result.newState, result.newScore, memoryId);
+      }
+      this.db.exec('COMMIT');
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      return { processed: batchResult.processed, transitioned: 0, results: [] };
+    }
+
+    return batchResult;
+  }
+
   // ── Storage ──────────────────────────────────────────────────────
 
   async store(request: StoreRequest): Promise<Memory> {
@@ -1132,6 +1261,8 @@ export class SqliteMemoryStore implements MemoryStore {
     // Touch access exactly once per final result
     for (const { memory } of finalResults) {
       this.touchAccessed(memory.id);
+      // Reinforce on access (PR 2b)
+      try { this.reinforceMemory(memory.id); } catch { /* best-effort */ }
     }
 
     // Fallback: if one list was empty, fall back to the other (already tracked above)
@@ -1139,6 +1270,7 @@ export class SqliteMemoryStore implements MemoryStore {
       const fallback = keywordResults.length > 0 ? keywordResults : semanticResults;
       for (const { memory } of fallback.slice(0, limit)) {
         this.touchAccessed(memory.id);
+        try { this.reinforceMemory(memory.id); } catch { /* best-effort */ }
       }
       return { results: fallback.slice(0, limit) };
     }
@@ -1215,9 +1347,37 @@ export class SqliteMemoryStore implements MemoryStore {
       ? interleaveBalanced(sources, perSource)
       : flattenByScore(sources, perSource);
 
-    return ordered
+    const results = ordered
       .slice(0, q.limit)
       .map(c => this.toSessionSearchResult(c, q));
+
+    // PR 2b: reinforce memories referenced by compacted summaries.
+    // Only summaries carry memory_ids in the PR 1 schema. We query the
+    // memory_ids column for the surfaced summary IDs (not fetched by
+    // scoreSessionSource which only selects content/embedding/status).
+    const summaryIds = ordered
+      .slice(0, q.limit)
+      .filter(c => c.source === 'session_summary')
+      .map(c => c.row.id);
+    if (summaryIds.length > 0) {
+      try {
+        const placeholders = summaryIds.map(() => '?').join(',');
+        const rows = this.db.prepare(
+          `SELECT memory_ids FROM session_summaries WHERE id IN (${placeholders})`,
+        ).all(...summaryIds) as { memory_ids: string | null }[];
+        for (const row of rows) {
+          if (!row.memory_ids) continue;
+          try {
+            const ids: string[] = JSON.parse(row.memory_ids);
+            for (const memId of ids) {
+              try { this.reinforceMemory(memId); } catch { /* best-effort */ }
+            }
+          } catch { /* malformed JSON → skip */ }
+        }
+      } catch { /* best-effort */ }
+    }
+
+    return results;
   }
 
   /**
@@ -1329,13 +1489,23 @@ export class SqliteMemoryStore implements MemoryStore {
         : c.content;
     }
     if (q.explain) {
+      // PR 2b: activation_score multiplier for explain finalScore.
+      // Session ranking `score` is left un-decayed (PR 1 stability), but
+      // the explain's `finalScore` reflects the full decay picture.
+      let activationScore = 1.0;
+      try {
+        const memRow = this.db.prepare(
+          'SELECT activation_score FROM memories WHERE id = ?',
+        ).get(c.row.id) as { activation_score: number | undefined } | undefined;
+        activationScore = memRow?.activation_score ?? 1.0;
+      } catch { /* best-effort */ }
       const explain: UnifiedSearchExplain = {
         keywordRank: c.keywordRank,
         semanticCosine: c.semanticScore,
         sourceMultiplier: 1,
-        decayFactor,
+        decayFactor: decayFactor * activationScore,
         accessMultiplier: 1,
-        finalScore: c.score,
+        finalScore: c.score * decayFactor * activationScore,
       };
       result.explain = explain;
     }
@@ -1390,6 +1560,8 @@ export class SqliteMemoryStore implements MemoryStore {
     if (trackAccess) {
       for (const { memory } of results) {
         this.touchAccessed(memory.id);
+        // Reinforce on access (PR 2b): resets timer, reverts early stages.
+        try { this.reinforceMemory(memory.id); } catch { /* best-effort */ }
       }
     }
 
