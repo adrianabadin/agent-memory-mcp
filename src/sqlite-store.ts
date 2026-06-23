@@ -742,6 +742,13 @@ export class SqliteMemoryStore implements MemoryStore {
 
       this.db.exec('PRAGMA user_version = 5');
     }
+
+    // ── v6: Revive review enrichment (gist_id + confidence) ──
+    if (current < 6) {
+      this.addColumnIfMissing('memory_revive_reviews', 'gist_id', 'TEXT');
+      this.addColumnIfMissing('memory_revive_reviews', 'confidence', 'REAL');
+      this.db.exec('PRAGMA user_version = 6');
+    }
   }
 
   /**
@@ -905,19 +912,20 @@ export class SqliteMemoryStore implements MemoryStore {
     const batchResult = evaluateDecayBatch(batchInput, cfg);
 
     // Persist all transitions in one atomic transaction.
+    // Also create gists for gist_only transitions and prune purged originals.
     this.db.exec('BEGIN');
     try {
       for (const { memoryId, result } of batchResult.results) {
         if (!result.transitioned) continue;
+        const fromState = batchInput.find(m => m.memoryId === memoryId)!.currentState;
         // Log the transition
         this.db.prepare(
           `INSERT INTO memory_decay_log (id, memory_id, from_state, to_state, reason, score_before, score_after, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(
           randomUUID(), memoryId,
-          batchInput.find(m => m.memoryId === memoryId)!.currentState,
-          result.newState, result.reason,
-          evaluateActivationScore(batchInput.find(m => m.memoryId === memoryId)!.currentState),
+          fromState, result.newState, result.reason,
+          evaluateActivationScore(fromState),
           result.newScore,
           new Date().toISOString(),
         );
@@ -925,6 +933,11 @@ export class SqliteMemoryStore implements MemoryStore {
         this.db.prepare(
           'UPDATE memories SET memory_state = ?, activation_score = ? WHERE id = ?',
         ).run(result.newState, result.newScore, memoryId);
+
+        // Create gist when transitioning to gist_only (inline within transaction)
+        if (result.newState === 'gist_only' && fromState !== 'gist_only') {
+          this.createMemoryGist(memoryId);
+        }
       }
       this.db.exec('COMMIT');
     } catch (e) {
@@ -932,7 +945,170 @@ export class SqliteMemoryStore implements MemoryStore {
       return { processed: batchResult.processed, transitioned: 0, results: [] };
     }
 
+    // Timed prune: after commit, remove purged originals not retained by revive gate
+    this.prunePurgedMemories();
+
     return batchResult;
+  }
+
+  // ── Gradual forgetting: gist creation, revive gate, timed prune ──
+
+  /**
+   * Create a memory_gists row for a memory transitioning to gist_only.
+   * Extracts the core fact from the memory content and stores a compact gist
+   * that survives the original's eventual purge.
+   */
+  createMemoryGist(memoryId: string): string {
+    const row = this.db.prepare(
+      'SELECT id, content, category, tags FROM memories WHERE id = ?',
+    ).get(memoryId) as { id: string; content: string; category: string; tags: string } | undefined;
+
+    if (!row) throw new MemoryNotFoundError(memoryId);
+
+    const gistId = randomUUID();
+    const now = new Date().toISOString();
+    const tags: string[] = JSON.parse(row.tags);
+
+    // Derive gist fields from the memory content.
+    // core_fact: first sentence or first 200 chars
+    const firstSentence = row.content.match(/^[^.!?]+[.!?]/);
+    const coreFact = firstSentence
+      ? firstSentence[0].trim()
+      : row.content.slice(0, 200).trim();
+
+    // why_it_matters: category-based reasoning
+    const whyMap: Record<string, string> = {
+      'bug-fix': 'Prevents recurring bugs and regression',
+      'architecture': 'Shapes structural decisions across the codebase',
+      'security': 'Critical for security posture',
+      'performance': 'Impacts system performance characteristics',
+      'learning': 'Captures hard-won knowledge',
+      'debugging': 'Debugging insight that may recur',
+      'code-solution': 'Reusable code pattern',
+      'tool-usage': 'Tool configuration or usage pattern',
+      'observation': 'Environmental observation',
+      'personal': 'Personal workflow preference',
+      'relationship': 'Team or collaboration context',
+      'other': 'General knowledge',
+    };
+    const whyItMatters = whyMap[row.category] ?? 'Retained for future reference';
+
+    // revive_triggers: derived from tags + category keywords
+    const triggers = [...tags.slice(0, 5), row.category];
+
+    this.db.prepare(
+      `INSERT INTO memory_gists (id, original_id, original_source, kind, core_fact, why_it_matters, revive_triggers, non_forgettable, created_at, updated_at, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      gistId, memoryId, 'memory', row.category, coreFact, whyItMatters,
+      JSON.stringify(triggers), 1, now, now, 'active',
+    );
+
+    return gistId;
+  }
+
+  /**
+   * Revive-before-prune gate: evaluates whether a deep-decay memory should be
+   * revived, pruned, or deferred. Records the decision in memory_revive_reviews.
+   *
+   * Decision logic:
+   *   - confidence >= 0.7  → 'revive' (reinforce the memory)
+   *   - confidence < 0.7   → 'defer' (leave for next evaluation cycle)
+   *   - explicit prune=true → 'prune' (caller explicitly requests removal)
+   *
+   * Returns the decision and the review record id.
+   */
+  reviveMemory(memoryId: string, opts?: { confidence?: number; prune?: boolean }): {
+    decision: 'revive' | 'prune' | 'defer';
+    reviewId: string;
+  } {
+    const row = this.db.prepare(
+      'SELECT id, memory_state, activation_score, content FROM memories WHERE id = ?',
+    ).get(memoryId) as {
+      id: string; memory_state: string; activation_score: number; content: string;
+    } | undefined;
+
+    if (!row) throw new MemoryNotFoundError(memoryId);
+
+    const confidence = opts?.confidence ?? 0.5;
+    const reviewId = randomUUID();
+    const now = new Date().toISOString();
+
+    let decision: 'revive' | 'prune' | 'defer';
+    let reason: string;
+
+    if (opts?.prune) {
+      decision = 'prune';
+      reason = 'explicit prune requested';
+    } else if (confidence >= 0.7) {
+      decision = 'revive';
+      reason = `confidence ${confidence.toFixed(2)} >= 0.7 threshold`;
+    } else {
+      decision = 'defer';
+      reason = `confidence ${confidence.toFixed(2)} < 0.7 threshold; deferred for next cycle`;
+    }
+
+    // Find the associated gist (if any) for traceability
+    const gist = this.db.prepare(
+      'SELECT id FROM memory_gists WHERE original_id = ? ORDER BY created_at DESC LIMIT 1',
+    ).get(memoryId) as { id: string } | undefined;
+
+    this.db.prepare(
+      `INSERT INTO memory_revive_reviews (id, memory_id, decision, reason, model, created_at, gist_id, confidence)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(reviewId, memoryId, decision, reason, null, now, gist?.id ?? null, confidence);
+
+    // Execute the decision
+    if (decision === 'revive') {
+      this.reinforceMemory(memoryId);
+    } else if (decision === 'prune') {
+      this.purgeMemoryAndEmbedding(memoryId);
+    }
+    // 'defer' → no action, just the review record
+
+    return { decision, reviewId };
+  }
+
+  /**
+   * Timed prune: permanently delete the original memory row (and its embedding)
+   * for memories that have reached 'purged' state AND are not retained by a
+   * recent revive gate. The associated gist is preserved.
+   *
+   * Returns the count of pruned memories.
+   */
+  prunePurgedMemories(): number {
+    // Find purged memories that have NOT been revived in their last review
+    const purged = this.db.prepare(
+      `SELECT m.id FROM memories m
+       WHERE m.memory_state = 'purged'
+         AND NOT EXISTS (
+           SELECT 1 FROM memory_revive_reviews r
+           WHERE r.memory_id = m.id
+             AND r.decision = 'revive'
+             AND r.created_at > datetime('now', '-30 days')
+         )`,
+    ).all() as Array<{ id: string }>;
+
+    let pruned = 0;
+    for (const mem of purged) {
+      this.purgeMemoryAndEmbedding(mem.id);
+      // Mark associated gists as original_pruned_at
+      this.db.prepare(
+        'UPDATE memory_gists SET original_pruned_at = ?, updated_at = ? WHERE original_id = ?',
+      ).run(new Date().toISOString(), new Date().toISOString(), mem.id);
+      pruned++;
+    }
+
+    return pruned;
+  }
+
+  /**
+   * Hard-delete a memory row and its embedding. Used by revive gate (prune decision)
+   * and timed purge. The associated gist survives.
+   */
+  private purgeMemoryAndEmbedding(memoryId: string): void {
+    this.db.prepare('DELETE FROM memory_embeddings WHERE id = ?').run(memoryId);
+    this.db.prepare('DELETE FROM memories WHERE id = ?').run(memoryId);
   }
 
   // ── Storage ──────────────────────────────────────────────────────

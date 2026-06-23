@@ -2,6 +2,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { SqliteMemoryStore } from '../src/sqlite-store.js';
 import { MockEmbedder } from './mocks.js';
@@ -723,5 +724,307 @@ describe('activationMultiplier in search', () => {
     expect(row.memory_state).toBe('active');
     const reinforcedAt = new Date(row.last_reinforced_at).getTime();
     expect(Date.now() - reinforcedAt).toBeLessThan(5000);
+  });
+});
+
+// ── Gist creation on gist_only transition ───────────────────────────
+
+describe('createMemoryGist', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let verify: DatabaseSync;
+
+  beforeEach(async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'gist-create-'));
+    dbPath = join(tmpDir, 'test.db');
+    const embedder = new MockEmbedder();
+    store = new SqliteMemoryStore(dbPath, embedder);
+    await store.initialize();
+    verify = new DatabaseSync(dbPath);
+  });
+
+  afterEach(async () => {
+    verify.close();
+    store.close();
+    await rm(join(dbPath, '..'), { recursive: true, force: true });
+  });
+
+  it('creates a gist row with required fields', async () => {
+    const mem = await store.store({ content: 'JWT auth expires after 24 hours. Use refresh tokens.', category: 'architecture', tags: ['jwt', 'auth'] });
+    const gistId = store.createMemoryGist(mem.id);
+
+    const gist = verify.prepare('SELECT * FROM memory_gists WHERE id = ?').get(gistId) as Record<string, unknown>;
+    expect(gist).toBeTruthy();
+    expect(gist['original_id']).toBe(mem.id);
+    expect(gist['original_source']).toBe('memory');
+    expect(gist['kind']).toBe('architecture');
+    expect(gist['core_fact']).toBeTruthy();
+    expect(gist['why_it_matters']).toBeTruthy();
+    expect(gist['revive_triggers']).toBeTruthy();
+    expect(gist['non_forgettable']).toBe(1);
+    expect(gist['status']).toBe('active');
+  });
+
+  it('extracts core_fact from first sentence', async () => {
+    const mem = await store.store({ content: 'Use bcrypt for password hashing. Never store plaintext.', category: 'security', tags: [] });
+    const gistId = store.createMemoryGist(mem.id);
+
+    const gist = verify.prepare('SELECT core_fact FROM memory_gists WHERE id = ?').get(gistId) as { core_fact: string };
+    expect(gist.core_fact).toContain('Use bcrypt for password hashing');
+  });
+
+  it('throws MemoryNotFoundError for nonexistent id', () => {
+    expect(() => store.createMemoryGist('nonexistent')).toThrow(MemoryNotFoundError);
+  });
+
+  it('creates gist with non_forgettable=1', async () => {
+    const mem = await store.store({ content: 'Important pattern', category: 'learning', tags: [] });
+    const gistId = store.createMemoryGist(mem.id);
+
+    const gist = verify.prepare('SELECT non_forgettable FROM memory_gists WHERE id = ?').get(gistId) as { non_forgettable: number };
+    expect(gist.non_forgettable).toBe(1);
+  });
+});
+
+// ── Gist creation during decay evaluation ───────────────────────────
+
+describe('gist creation on gist_only transition', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let verify: DatabaseSync;
+
+  beforeEach(async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'gist-decay-'));
+    dbPath = join(tmpDir, 'test.db');
+    const embedder = new MockEmbedder();
+    store = new SqliteMemoryStore(dbPath, embedder);
+    await store.initialize();
+    verify = new DatabaseSync(dbPath);
+  });
+
+  afterEach(async () => {
+    verify.close();
+    store.close();
+    await rm(join(dbPath, '..'), { recursive: true, force: true });
+  });
+
+  it('creates a gist when memory transitions to gist_only', async () => {
+    const mem = await store.store({ content: 'Old knowledge that faded', category: 'learning', tags: [] });
+    // Force to just before gist_only boundary (665 days default)
+    const old = new Date(Date.now() - 666 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ? WHERE id = ?').run(old, mem.id);
+
+    store.evaluateAllMemoriesForDecay(DEFAULT_FORGETTING_CONFIG);
+
+    const row = verify.prepare('SELECT memory_state FROM memories WHERE id = ?').get(mem.id) as { memory_state: string };
+    expect(row.memory_state).toBe('gist_only');
+
+    // Verify gist was created
+    const gists = verify.prepare('SELECT * FROM memory_gists WHERE original_id = ?').all(mem.id) as Array<Record<string, unknown>>;
+    expect(gists.length).toBe(1);
+    expect(gists[0]['non_forgettable']).toBe(1);
+  });
+
+  it('does not create duplicate gists for same memory', async () => {
+    const mem = await store.store({ content: 'Repeated evaluation', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 666 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ? WHERE id = ?').run(old, mem.id);
+
+    // Run twice
+    store.evaluateAllMemoriesForDecay(DEFAULT_FORGETTING_CONFIG);
+    store.evaluateAllMemoriesForDecay(DEFAULT_FORGETTING_CONFIG);
+
+    const gists = verify.prepare('SELECT * FROM memory_gists WHERE original_id = ?').all(mem.id) as Array<Record<string, unknown>>;
+    // Should have exactly 1 gist (created on first transition, not duplicated)
+    expect(gists.length).toBe(1);
+  });
+});
+
+// ── Revive gate ─────────────────────────────────────────────────────
+
+describe('reviveMemory', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let verify: DatabaseSync;
+
+  beforeEach(async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'revive-'));
+    dbPath = join(tmpDir, 'test.db');
+    const embedder = new MockEmbedder();
+    store = new SqliteMemoryStore(dbPath, embedder);
+    await store.initialize();
+    verify = new DatabaseSync(dbPath);
+  });
+
+  afterEach(async () => {
+    verify.close();
+    store.close();
+    await rm(join(dbPath, '..'), { recursive: true, force: true });
+  });
+
+  it('revives memory when confidence >= 0.7', async () => {
+    const mem = await store.store({ content: 'Revive this', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 50 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ?, memory_state = ? WHERE id = ?').run(old, 'cooling', mem.id);
+
+    const result = store.reviveMemory(mem.id, { confidence: 0.8 });
+    expect(result.decision).toBe('revive');
+
+    // Verify memory was reinforced
+    const row = verify.prepare('SELECT memory_state FROM memories WHERE id = ?').get(mem.id) as { memory_state: string };
+    expect(row.memory_state).toBe('active');
+
+    // Verify review record
+    const review = verify.prepare('SELECT decision, confidence FROM memory_revive_reviews WHERE id = ?').get(result.reviewId) as { decision: string; confidence: number };
+    expect(review.decision).toBe('revive');
+    expect(review.confidence).toBe(0.8);
+  });
+
+  it('defers memory when confidence < 0.7', async () => {
+    const mem = await store.store({ content: 'Defer this', category: 'learning', tags: [] });
+    const old = new Date(Date.now() - 50 * MS_PER_DAY).toISOString();
+    verify.prepare('UPDATE memories SET last_reinforced_at = ?, memory_state = ? WHERE id = ?').run(old, 'cooling', mem.id);
+
+    const result = store.reviveMemory(mem.id, { confidence: 0.5 });
+    expect(result.decision).toBe('defer');
+
+    // Memory should NOT be reinforced
+    const row = verify.prepare('SELECT memory_state FROM memories WHERE id = ?').get(mem.id) as { memory_state: string };
+    expect(row.memory_state).toBe('cooling');
+  });
+
+  it('prunes memory when explicit prune requested', async () => {
+    const mem = await store.store({ content: 'Prune this', category: 'learning', tags: [] });
+
+    const result = store.reviveMemory(mem.id, { prune: true });
+    expect(result.decision).toBe('prune');
+
+    // Memory should be deleted
+    const row = verify.prepare('SELECT id FROM memories WHERE id = ?').get(mem.id);
+    expect(row).toBeUndefined();
+
+    // Embedding should be deleted
+    const emb = verify.prepare('SELECT id FROM memory_embeddings WHERE id = ?').get(mem.id);
+    expect(emb).toBeUndefined();
+  });
+
+  it('links review to associated gist', async () => {
+    const mem = await store.store({ content: 'Has gist', category: 'learning', tags: [] });
+    const gistId = store.createMemoryGist(mem.id);
+
+    const result = store.reviveMemory(mem.id, { confidence: 0.8 });
+    const review = verify.prepare('SELECT gist_id FROM memory_revive_reviews WHERE id = ?').get(result.reviewId) as { gist_id: string | null };
+    expect(review.gist_id).toBe(gistId);
+  });
+
+  it('throws MemoryNotFoundError for nonexistent id', () => {
+    expect(() => store.reviveMemory('nonexistent')).toThrow(MemoryNotFoundError);
+  });
+});
+
+// ── Timed prune of purged originals ─────────────────────────────────
+
+describe('prunePurgedMemories', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let verify: DatabaseSync;
+
+  beforeEach(async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'prune-purged-'));
+    dbPath = join(tmpDir, 'test.db');
+    const embedder = new MockEmbedder();
+    store = new SqliteMemoryStore(dbPath, embedder);
+    await store.initialize();
+    verify = new DatabaseSync(dbPath);
+  });
+
+  afterEach(async () => {
+    verify.close();
+    store.close();
+    await rm(join(dbPath, '..'), { recursive: true, force: true });
+  });
+
+  it('deletes purged memory rows and embeddings', async () => {
+    const mem = await store.store({ content: 'Will be purged', category: 'learning', tags: [] });
+    verify.prepare("UPDATE memories SET memory_state = 'purged' WHERE id = ?").run(mem.id);
+
+    const pruned = store.prunePurgedMemories();
+    expect(pruned).toBe(1);
+
+    const row = verify.prepare('SELECT id FROM memories WHERE id = ?').get(mem.id);
+    expect(row).toBeUndefined();
+
+    const emb = verify.prepare('SELECT id FROM memory_embeddings WHERE id = ?').get(mem.id);
+    expect(emb).toBeUndefined();
+  });
+
+  it('preserves the gist when original is pruned', async () => {
+    const mem = await store.store({ content: 'Purge with gist', category: 'learning', tags: [] });
+    const gistId = store.createMemoryGist(mem.id);
+    verify.prepare("UPDATE memories SET memory_state = 'purged' WHERE id = ?").run(mem.id);
+
+    store.prunePurgedMemories();
+
+    // Gist should survive
+    const gist = verify.prepare('SELECT id, original_pruned_at FROM memory_gists WHERE id = ?').get(gistId) as { id: string; original_pruned_at: string | null };
+    expect(gist.id).toBe(gistId);
+    expect(gist.original_pruned_at).toBeTruthy();
+  });
+
+  it('does not prune purged memories with recent revive review', async () => {
+    const mem = await store.store({ content: 'Revived purged', category: 'learning', tags: [] });
+    verify.prepare("UPDATE memories SET memory_state = 'purged' WHERE id = ?").run(mem.id);
+
+    // Add a recent revive review
+    verify.prepare(
+      `INSERT INTO memory_revive_reviews (id, memory_id, decision, reason, model, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(randomUUID(), mem.id, 'revive', 'recent revive', null, new Date().toISOString());
+
+    const pruned = store.prunePurgedMemories();
+    expect(pruned).toBe(0);
+
+    // Memory should still exist
+    const row = verify.prepare('SELECT id FROM memories WHERE id = ?').get(mem.id) as { id: string };
+    expect(row.id).toBe(mem.id);
+  });
+
+  it('skips non-purged memories', async () => {
+    await store.store({ content: 'Still active', category: 'learning', tags: [] });
+
+    const pruned = store.prunePurgedMemories();
+    expect(pruned).toBe(0);
+  });
+});
+
+// ── Schema v6: revive_reviews enrichment ────────────────────────────
+
+describe('memory_revive_reviews schema v6', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let verify: DatabaseSync;
+
+  beforeEach(async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'revive-schema-'));
+    dbPath = join(tmpDir, 'test.db');
+    const embedder = new MockEmbedder();
+    store = new SqliteMemoryStore(dbPath, embedder);
+    await store.initialize();
+    verify = new DatabaseSync(dbPath);
+  });
+
+  afterEach(async () => {
+    verify.close();
+    store.close();
+    await rm(join(dbPath, '..'), { recursive: true, force: true });
+  });
+
+  it('has gist_id column on memory_revive_reviews', () => {
+    const cols = verify.prepare('PRAGMA table_info(memory_revive_reviews)').all() as { name: string }[];
+    expect(cols.map(c => c.name)).toContain('gist_id');
+  });
+
+  it('has confidence column on memory_revive_reviews', () => {
+    const cols = verify.prepare('PRAGMA table_info(memory_revive_reviews)').all() as { name: string }[];
+    expect(cols.map(c => c.name)).toContain('confidence');
   });
 });

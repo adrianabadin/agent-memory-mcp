@@ -75,7 +75,7 @@ describe('provenance', () => {
     // v0 → v1 (provenance) → v2 (lifecycle/session ledger) → v3 (session decay)
     // → v4 (gradual forgetting); migrations run automatically and bump the
     // target version. Updated for PR-2a.
-    expect(userVersionRow.user_version).toBe(5);
+    expect(userVersionRow.user_version).toBe(6);
     const row = migrated.prepare(`SELECT id, content, origin, source_tool, session_id, content_hash FROM memories WHERE id = ?`).get('legacy-1') as Record<string, unknown>;
     expect(row.content).toBe('Legacy row');
     expect(row.origin).toBe('unknown');

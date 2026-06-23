@@ -51,7 +51,7 @@ describe('T-001: migration v2 and status schema', () => {
 
   it('bumps user_version to 4 after initialize', () => {
     const db = new DatabaseSync(dbPath);
-    expect(userVersion(db)).toBe(5);
+    expect(userVersion(db)).toBe(6);
     db.close();
   });
 
@@ -107,10 +107,10 @@ describe('T-001: migration v2 and status schema', () => {
     });
   }
 
-  it('re-initialization is idempotent (user_version stays 4, no error)', async () => {
+  it('re-initialization is idempotent (user_version stays 6, no error)', async () => {
     await expect(store.initialize()).resolves.toBeUndefined();
     const db = new DatabaseSync(dbPath);
-    expect(userVersion(db)).toBe(5);
+    expect(userVersion(db)).toBe(6);
     db.close();
   });
 
@@ -169,7 +169,7 @@ describe('T-001: migration v2 and status schema', () => {
 
     // Inspect after the store handle is released (Windows-friendly).
     const check = new DatabaseSync(v1Path);
-    expect(userVersion(check)).toBe(5);
+    expect(userVersion(check)).toBe(6);
     const cols = tableColumns(check, 'memories');
     expect(cols).toEqual(expect.arrayContaining(['status', 'review_reason', 'reviewed_at']));
     expect(tableColumns(check, 'session_prompts').length).toBeGreaterThan(0);
