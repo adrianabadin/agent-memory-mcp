@@ -200,6 +200,24 @@ const dummyEmbedder: Embedder = {
  *     immediately (capture-pipeline R2);
  *   - uses the path convention `${dbPath}.db` to match the main store.
  *
+ * **W2 — session-ledger-only surface.** The handle is typed as
+ * {@link LedgerStore}, which exposes ONLY `initialize` / `close` plus the
+ * session-ledger methods (`storeSessionPrompt`, `storeSessionResponse`,
+ * `storeSessionToolCall`, `setSessionContext`, `getSessionContext`). The
+ * memory store/search methods (`store`, `storeBatch`, `search`, `findRelated`,
+ * `listRecent`, `update`, `delete`, `stats`, `prune`) are NOT exposed — they
+ * remain on the underlying object but are invisible through this type, so a
+ * runaway drainer cannot fragment the memory data.
+ *
+ * **Windows EBUSY mitigation.** SQLite runs in WAL mode; combined with the
+ * 5s `busy_timeout` above, the drainer retries transient `SQLITE_BUSY`/EBUSY
+ * errors for up to 5s at the driver level. The drainer CLI
+ * (`cli/capture-drain.mjs`) additionally wraps each entry write in a 3x retry
+ * with exponential backoff (100ms, 200ms, 400ms) so a persistent lock is
+ * retried at the application layer as well. The two layers compose: driver
+ * retry first, then application retry, then the failed entry stays in the
+ * queue for the next drain run (no data loss).
+ *
  * Callers MUST `close()` the store when the drainer exits to release the file
  * lock.
  *
