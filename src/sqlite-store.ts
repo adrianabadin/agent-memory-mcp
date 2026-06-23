@@ -44,6 +44,13 @@ import {
   parseDecayHalfLife,
   importanceMultiplier,
   EVERGREEN_TAGS,
+  transitionDecayState,
+  DEFAULT_FORGETTING_CONFIG,
+} from './decay.js';
+import type {
+  ForgettingConfig,
+  DecayState,
+  DecayTransitionResult,
 } from './decay.js';
 import {
   embeddingToBlob,
@@ -123,6 +130,9 @@ interface MemoryRow {
   status?: string | null;
   review_reason?: string | null;
   reviewed_at?: string | null;
+  activation_score?: number;
+  memory_state?: string;
+  last_reinforced_at?: string | null;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────
@@ -637,6 +647,52 @@ export class SqliteMemoryStore implements MemoryStore {
 
       this.db.exec('PRAGMA user_version = 3');
     }
+    if (current < 4) {
+      // ── Gradual forgetting columns on memories ──
+      this.addColumnIfMissing('memories', 'activation_score', 'REAL DEFAULT 1.0');
+      this.addColumnIfMissing('memories', 'memory_state', "TEXT NOT NULL DEFAULT 'active'");
+      this.addColumnIfMissing('memories', 'last_reinforced_at', 'TEXT');
+
+      // ── memory_gists table ──
+      // original_id is intentionally NOT a FK so the gist survives original purge.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_gists (
+          id TEXT PRIMARY KEY,
+          original_id TEXT NOT NULL,
+          original_source TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          core_fact TEXT NOT NULL,
+          why_it_matters TEXT NOT NULL,
+          revive_triggers TEXT NOT NULL,
+          non_forgettable INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          original_pruned_at TEXT,
+          status TEXT NOT NULL DEFAULT 'active'
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_gists_original_id ON memory_gists(original_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_gists_status ON memory_gists(status);
+        CREATE INDEX IF NOT EXISTS idx_memory_gists_kind ON memory_gists(kind);
+      `);
+
+      // ── memory_decay_log table ──
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_decay_log (
+          id TEXT PRIMARY KEY,
+          memory_id TEXT NOT NULL,
+          from_state TEXT NOT NULL,
+          to_state TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          score_before REAL NOT NULL,
+          score_after REAL NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_decay_log_memory_id ON memory_decay_log(memory_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_decay_log_created_at ON memory_decay_log(created_at);
+      `);
+
+      this.db.exec('PRAGMA user_version = 4');
+    }
   }
 
   private addColumnIfMissing(table: string, column: string, ddl: string): void {
@@ -651,6 +707,55 @@ export class SqliteMemoryStore implements MemoryStore {
     } catch {
       // Already closed or never opened — ignore.
     }
+  }
+
+  // ── Decay state transitions ───────────────────────────────────────
+
+  /**
+   * Evaluate a single memory's decay transition, persist the result, and
+   * return the transition outcome. Reads the current `memory_state` and
+   * `last_reinforced_at` (falling back to `created_at` when NULL), computes
+   * the target stage via `transitionDecayState`, logs the transition to
+   * `memory_decay_log`, and updates `memory_state` / `activation_score`.
+   */
+  transitionDecayStateForMemory(
+    memoryId: string,
+    config?: ForgettingConfig,
+  ): DecayTransitionResult {
+    const row = this.db.prepare(
+      'SELECT memory_state, last_reinforced_at, created_at FROM memories WHERE id = ?',
+    ).get(memoryId) as { memory_state: string; last_reinforced_at: string | null; created_at: string } | undefined;
+
+    if (!row) throw new MemoryNotFoundError(memoryId);
+
+    const currentState = (row.memory_state ?? 'active') as DecayState;
+    const lastReinforcedAt = row.last_reinforced_at ?? row.created_at;
+
+    const result = transitionDecayState(
+      {
+        memoryId,
+        currentState,
+        lastReinforcedAt,
+        config: config ?? DEFAULT_FORGETTING_CONFIG,
+      },
+      (record) => {
+        this.db.prepare(
+          `INSERT INTO memory_decay_log (id, memory_id, from_state, to_state, reason, score_before, score_after, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          randomUUID(), record.memory_id, record.from_state, record.to_state,
+          record.reason, record.score_before, record.score_after, new Date().toISOString(),
+        );
+      },
+    );
+
+    if (result.transitioned) {
+      this.db.prepare(
+        'UPDATE memories SET memory_state = ?, activation_score = ? WHERE id = ?',
+      ).run(result.newState, result.newScore, memoryId);
+    }
+
+    return result;
   }
 
   // ── Storage ──────────────────────────────────────────────────────

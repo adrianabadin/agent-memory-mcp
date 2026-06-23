@@ -754,11 +754,11 @@ describe('T-008: migration v2 final verification', () => {
     expect(row.status).toBe('active');
   });
 
-  it('user_version is 3', () => {
+  it('user_version is 4', () => {
     const db = env.rawDb();
     const row = db.prepare('PRAGMA user_version').get() as { user_version: number };
     db.close();
-    expect(row.user_version).toBe(3);
+    expect(row.user_version).toBe(4);
   });
 
   it('data round-trips through every new table', async () => {

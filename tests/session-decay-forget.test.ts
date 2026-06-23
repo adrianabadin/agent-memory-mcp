@@ -110,7 +110,7 @@ describe('schema v3 migration: lifecycle columns on session tables', () => {
 
     const db = new DatabaseSync(dbPath);
     const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-    expect(version).toBe(3);
+    expect(version).toBe(4);
 
     // Prompt row: defaults backfilled from created_at
     const p = db.prepare(`SELECT * FROM session_prompts WHERE id = 'leg-p1'`).get() as Record<string, unknown>;
@@ -143,14 +143,14 @@ describe('schema v3 migration: lifecycle columns on session tables', () => {
     await store1.initialize();
     store1.close();
 
-    // Second initialize must not throw and must keep user_version at 3
+    // Second initialize must not throw and must keep user_version at 4
     const store2 = new SqliteMemoryStore(dbPath, embedder);
     await expect(store2.initialize()).resolves.toBeUndefined();
     store2.close();
 
     const db = new DatabaseSync(dbPath);
     const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-    expect(version).toBe(3);
+    expect(version).toBe(4);
     // Row still present and intact after two migrations
     const p = db.prepare(`SELECT raw_prompt, status FROM session_prompts WHERE id = 'leg-p1'`).get() as any;
     expect(p.raw_prompt).toBe('legacy prompt');
@@ -170,7 +170,7 @@ describe('schema v3 migration: lifecycle columns on session tables', () => {
 
     const db = new DatabaseSync(dbPath);
     const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-    expect(version).toBe(3);
+    expect(version).toBe(4);
 
     const cols = (tbl: string) =>
       (db.prepare(`PRAGMA table_info(${tbl})`).all() as { name: string }[]).map(c => c.name);
