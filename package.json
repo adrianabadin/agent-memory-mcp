@@ -5,6 +5,17 @@
   "license": "GPL-3.0-or-later",
   "type": "module",
   "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./compose": {
+      "types": "./dist/compose.d.ts",
+      "default": "./dist/compose.js"
+    },
+    "./package.json": "./package.json"
+  },
   "bin": {
     "agent-memory-mcp": "dist/index.js"
   },

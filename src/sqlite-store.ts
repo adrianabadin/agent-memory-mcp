@@ -7,14 +7,36 @@ import type {
   MemoryCategory,
   MemoryOrigin,
   MemoryStats,
+  MemoryStatus,
   MemoryStore,
   PruneOptions,
   PruneResult,
+  ResolvedSearchQuery,
   SearchFilters,
   SearchMode,
   SearchResult,
+  SessionForgetResult,
+  SessionItemLifecycle,
+  SessionItemStatus,
+  SessionItemType,
+  SessionLedger,
+  SessionMeta,
+  SessionPrompt,
+  SessionPurgeResult,
+  SessionResponse,
+  SessionSearchResult,
+  SessionSummary,
+  SessionToolCall,
   StoreRequest,
+  UnifiedSearchExplain,
+  UnifiedSearchQuery,
+  UnifiedSearchSource,
   UpdateRequest,
+} from './types.js';
+import {
+  COMPACTED_SESSION_SOURCES,
+  RAW_SESSION_SOURCES,
+  SESSION_SEARCH_SOURCES,
 } from './types.js';
 import { ConcurrentUpdateError, MemoryNotFoundError } from './errors.js';
 import {
@@ -98,6 +120,9 @@ interface MemoryRow {
   source_tool?: string | null;
   session_id?: string | null;
   content_hash?: string | null;
+  status?: string | null;
+  review_reason?: string | null;
+  reviewed_at?: string | null;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────
@@ -120,6 +145,17 @@ function rowToMemory(row: MemoryRow): Memory {
       ...(row.session_id ? { sessionId: row.session_id } : {}),
       ...(row.content_hash ? { contentHash: row.content_hash } : {}),
     };
+  }
+  if (row.status && row.status !== 'active') {
+    memory.status = row.status as MemoryStatus;
+  } else if (row.status === 'active') {
+    memory.status = 'active';
+  }
+  if (row.review_reason) {
+    memory.reviewReason = row.review_reason;
+  }
+  if (row.reviewed_at) {
+    memory.reviewedAt = row.reviewed_at;
   }
   return memory;
 }
@@ -149,10 +185,326 @@ function applyDecayWithFactor(row: MemoryRow, rawScore: number): { score: number
   return { score: rawScore * factor, factor };
 }
 
+/**
+ * Session decay scoring helper (task 2.5).
+ *
+ * Reuses the same exponential-decay + access-importance model as memories
+ * (computeDecayFactor × importanceMultiplier) so session-ledger records can be
+ * ranked with retention semantics comparable to the memory lifecycle.
+ *
+ * This is a PURE function: given a row-shaped object with `updated_at`,
+ * `access_count`, and `last_accessed_at`, it returns a multiplier in (0, 1].
+ * Hook point: session search (not yet implemented) will multiply raw relevance
+ * scores by this factor before ranking, exactly as `applyDecay` does for
+ * memories. `getSession` already excludes `status='forgotten'` rows.
+ */
+export function scoreSessionRow(row: SessionLifecycleColumns): number {
+  const updatedAt = row.updated_at ?? row.last_accessed_at ?? new Date().toISOString();
+  if (DECAY_HALF_LIFE_DAYS <= 0) return 1;
+  const effectiveHalfLife = DECAY_HALF_LIFE_DAYS * importanceMultiplier({
+    access_count: row.access_count ?? 0,
+    updated_at: updatedAt,
+    last_accessed_at: row.last_accessed_at ?? updatedAt,
+  });
+  return computeDecayFactor(updatedAt, effectiveHalfLife);
+}
+
+// ── Unified search: parameter parsing (PR 1) ───────────────────────
+
+const VALID_UNIFIED_SOURCES: ReadonlySet<UnifiedSearchSource> = new Set<UnifiedSearchSource>([
+  'memory', 'session_prompt', 'session_response', 'session_tool_call',
+  'session_summary', 'global_error', 'promoted_pattern', 'gist',
+]);
+
+/**
+ * Parse and validate a UnifiedSearchQuery, applying documented defaults:
+ * limit=10, status='active', includeContent=false, maxContentChars=4000,
+ * includeRawSessionItems=false, sourceBalancing=true, explain=false.
+ *
+ * When `sources` is omitted it defaults to the session-ledger sources. Throws
+ * on an empty query, non-positive limit, negative maxContentChars, or an
+ * unknown source value.
+ */
+export function parseSearchQuery(query: UnifiedSearchQuery): ResolvedSearchQuery {
+  if (!query.query || !query.query.trim()) {
+    throw new Error('INVALID_ARGUMENT: query must be a non-empty string');
+  }
+  const limit = query.limit ?? 10;
+  if (!Number.isFinite(limit) || limit <= 0) {
+    throw new Error(`INVALID_ARGUMENT: limit must be a positive number (got ${query.limit})`);
+  }
+  const maxContentChars = query.maxContentChars ?? 4000;
+  if (!Number.isFinite(maxContentChars) || maxContentChars < 0) {
+    throw new Error(`INVALID_ARGUMENT: maxContentChars must be >= 0 (got ${query.maxContentChars})`);
+  }
+  const sources = query.sources ?? [...SESSION_SEARCH_SOURCES];
+  for (const s of sources) {
+    if (!VALID_UNIFIED_SOURCES.has(s)) {
+      throw new Error(`INVALID_ARGUMENT: unknown source '${s}'`);
+    }
+  }
+
+  const resolved: ResolvedSearchQuery = {
+    query: query.query.trim(),
+    sources,
+    limit,
+    status: query.status ?? 'active',
+    explain: query.explain ?? false,
+    includeContent: query.includeContent ?? false,
+    maxContentChars,
+    includeRawSessionItems: query.includeRawSessionItems ?? false,
+    sourceBalancing: query.sourceBalancing ?? true,
+  };
+  // The session ledger schema carries no per-row project association (only
+  // session_id), so projectId cannot be honored without returning cross-project
+  // rows. Reject it explicitly instead of silently ignoring the filter until the
+  // schema supports project scoping.
+  if (query.projectId) {
+    throw new Error(
+      'INVALID_ARGUMENT: projectId filtering is not supported for session search; ' +
+      'the session ledger schema has no project column. Use sessionId instead.',
+    );
+  }
+  if (query.sessionId) resolved.sessionId = query.sessionId;
+  if (query.after) resolved.after = query.after;
+  if (query.before) resolved.before = query.before;
+  return resolved;
+}
+
+/** Bounded snippet for DecisionHint summaries. */
+const DECISION_HINT_MAX_CHARS = 200;
+
+/**
+ * Build a DecisionHint: a bounded snippet plus a normalized relevance score and
+ * a flag indicating whether more detail exists behind the contentRef handle.
+ */
+function generateDecisionHint(
+  content: string,
+  relevanceScore: number,
+  maxContentChars: number,
+): { summary: string; relevanceScore: number; hasTruncatedDetail: boolean } {
+  const trimmed = content.trim();
+  const summary = trimmed.length > DECISION_HINT_MAX_CHARS
+    ? `${trimmed.slice(0, DECISION_HINT_MAX_CHARS - 1)}…`
+    : trimmed;
+  const hasTruncatedDetail =
+    trimmed.length > DECISION_HINT_MAX_CHARS || trimmed.length > maxContentChars;
+  const clamped = Math.max(0, Math.min(1, relevanceScore));
+  return { summary, relevanceScore: clamped, hasTruncatedDetail };
+}
+
+// ── Unified session search: internal scoring types ─────────────────
+
+/** Raw row shape returned by the per-source session candidate query. */
+interface SessionCandidateRow {
+  id: string;
+  session_id: string;
+  content: string | null;
+  created_at: string;
+  status: string | null;
+  embedding: Buffer | Uint8Array | null;
+}
+
+/** A session row after keyword/semantic scoring and RRF fusion. */
+interface ScoredSessionCandidate {
+  row: SessionCandidateRow;
+  source: UnifiedSearchSource;
+  content: string;
+  keywordScore: number;
+  semanticScore: number;
+  score: number;
+  keywordRank: number;
+  semanticRank: number;
+}
+
+/** Per-source table/column metadata for the unified session search. */
+const SESSION_SOURCE_META: Partial<Record<UnifiedSearchSource, {
+  table: string;
+  contentCol: string;
+  isCompact: boolean;
+}>> = {
+  session_summary: { table: 'session_summaries', contentCol: 'summary', isCompact: true },
+  session_prompt: { table: 'session_prompts', contentCol: 'raw_prompt', isCompact: false },
+  session_response: { table: 'session_responses', contentCol: 'full_response', isCompact: false },
+  session_tool_call: { table: 'session_tool_calls', contentCol: 'result_summary', isCompact: false },
+};
+
+/**
+ * Round-robin interleave candidates across sources so no single verbose source
+ * monopolizes the result list. Sources are visited in priority order
+ * (compacted-first), each contributing its best remaining candidate per round.
+ */
+function interleaveBalanced(
+  sources: UnifiedSearchSource[],
+  perSource: Map<UnifiedSearchSource, ScoredSessionCandidate[]>,
+): ScoredSessionCandidate[] {
+  const cursors = new Map<UnifiedSearchSource, number>(sources.map(s => [s, 0]));
+  const out: ScoredSessionCandidate[] = [];
+  let remaining = true;
+  while (remaining) {
+    remaining = false;
+    for (const source of sources) {
+      const list = perSource.get(source) ?? [];
+      const idx = cursors.get(source)!;
+      if (idx < list.length) {
+        out.push(list[idx]);
+        cursors.set(source, idx + 1);
+        remaining = true;
+      }
+    }
+  }
+  return out;
+}
+
+/** Flatten all source candidates and sort purely by fused score (best-first). */
+function flattenByScore(
+  sources: UnifiedSearchSource[],
+  perSource: Map<UnifiedSearchSource, ScoredSessionCandidate[]>,
+): ScoredSessionCandidate[] {
+  const all: ScoredSessionCandidate[] = [];
+  for (const source of sources) {
+    all.push(...(perSource.get(source) ?? []));
+  }
+  return all.sort((a, b) => b.score - a.score);
+}
+
+// ── Session ledger row types + converters ──────────────────────────
+
+/**
+ * Snake-case lifecycle columns as they live in the DB. Shared by all four
+ * session row types and used by the decay/forget helpers so they can read
+ * raw rows without mapping to camelCase first.
+ */
+interface SessionLifecycleColumns {
+  updated_at?: string | null;
+  access_count?: number | null;
+  last_accessed_at?: string | null;
+  status?: string | null;
+}
+
+interface SessionPromptRow extends SessionLifecycleColumns {
+  id: string;
+  session_id: string;
+  raw_prompt: string;
+  created_at: string;
+}
+
+interface SessionResponseRow extends SessionLifecycleColumns {
+  id: string;
+  session_id: string;
+  prompt_id: string;
+  full_response: string;
+  created_at: string;
+}
+
+interface SessionToolCallRow extends SessionLifecycleColumns {
+  id: string;
+  session_id: string;
+  prompt_id: string | null;
+  response_id: string | null;
+  tool_name: string;
+  args_safe: string | null;
+  result_summary: string | null;
+  importance: string | null;
+  created_at: string;
+}
+
+interface SessionSummaryRow extends SessionLifecycleColumns {
+  id: string;
+  session_id: string;
+  prompt_id: string | null;
+  response_id: string | null;
+  summary: string;
+  decisions: string | null;
+  key_titles: string | null;
+  memory_ids: string | null;
+  artifact_refs: string | null;
+  created_at: string;
+}
+
+function rowToSessionPrompt(row: SessionPromptRow): SessionPrompt {
+  const result: SessionPrompt = {
+    id: row.id,
+    sessionId: row.session_id,
+    rawPrompt: row.raw_prompt,
+    createdAt: row.created_at,
+  };
+  applySessionLifecycle(result, row);
+  return result;
+}
+
+function rowToSessionResponse(row: SessionResponseRow): SessionResponse {
+  const result: SessionResponse = {
+    id: row.id,
+    sessionId: row.session_id,
+    promptId: row.prompt_id,
+    fullResponse: row.full_response,
+    createdAt: row.created_at,
+  };
+  applySessionLifecycle(result, row);
+  return result;
+}
+
+function rowToSessionToolCall(row: SessionToolCallRow): SessionToolCall {
+  const result: SessionToolCall = {
+    id: row.id,
+    sessionId: row.session_id,
+    toolName: row.tool_name,
+    createdAt: row.created_at,
+  };
+  if (row.prompt_id) result.promptId = row.prompt_id;
+  if (row.response_id) result.responseId = row.response_id;
+  if (row.args_safe) result.argsSafe = row.args_safe;
+  if (row.result_summary) result.resultSummary = row.result_summary;
+  if (row.importance) result.importance = row.importance;
+  applySessionLifecycle(result, row);
+  return result;
+}
+
+function rowToSessionSummary(row: SessionSummaryRow): SessionSummary {
+  const result: SessionSummary = {
+    id: row.id,
+    sessionId: row.session_id,
+    summary: row.summary,
+    createdAt: row.created_at,
+  };
+  if (row.prompt_id) result.promptId = row.prompt_id;
+  if (row.response_id) result.responseId = row.response_id;
+  if (row.decisions) {
+    try { result.decisions = JSON.parse(row.decisions); } catch { /* malformed JSON → omit */ }
+  }
+  if (row.key_titles) {
+    try { result.keyTitles = JSON.parse(row.key_titles); } catch { /* omit */ }
+  }
+  if (row.memory_ids) {
+    try { result.memoryIds = JSON.parse(row.memory_ids); } catch { /* omit */ }
+  }
+  if (row.artifact_refs) {
+    try { result.artifactRefs = JSON.parse(row.artifact_refs); } catch { /* omit */ }
+  }
+  applySessionLifecycle(result, row);
+  return result;
+}
+
+/**
+ * Copy lifecycle columns from a raw DB row into a session item object.
+ * Pure helper shared by all four converters. Only sets fields when the
+ * column actually carries a value (backward-compatible with pre-v3 rows
+ * surfaced before a migration run).
+ */
+function applySessionLifecycle<T extends SessionItemLifecycle>(target: T, row: SessionLifecycleColumns): void {
+  if (row.updated_at != null) target.updatedAt = row.updated_at;
+  if (row.access_count != null) target.accessCount = row.access_count;
+  if (row.last_accessed_at != null) target.lastAccessedAt = row.last_accessed_at;
+  if (row.status) target.status = row.status as SessionItemStatus;
+}
+
 // ── SqliteMemoryStore ─────────────────────────────────────────────
 
 export class SqliteMemoryStore implements MemoryStore {
   private db!: DatabaseSync;
+  // In-memory session context (not persisted; set by callers via MCP ENV).
+  private sessionContext: { sessionId: string; projectId: string } | null = null;
 
   constructor(
     private readonly dbPath: string,
@@ -160,6 +512,9 @@ export class SqliteMemoryStore implements MemoryStore {
   ) {}
 
   async initialize(): Promise<void> {
+    // Close any existing handle first so re-initialization is safe and
+    // does not leak file locks (important on Windows WAL databases).
+    this.close();
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec(SCHEMA_SQL);
     this.runMigrations();
@@ -170,6 +525,8 @@ export class SqliteMemoryStore implements MemoryStore {
    * migration so re-initialization is a no-op.
    *
    * v0 → v1: add provenance columns to `memories`.
+   * v1 → v2: add memory lifecycle (status/review columns), session ledger tables,
+   *          topic aliases, and supporting indexes.
    */
   private runMigrations(): void {
     const current = (this.db.prepare('PRAGMA user_version').get() as { user_version: number } | undefined)?.user_version ?? 0;
@@ -180,6 +537,106 @@ export class SqliteMemoryStore implements MemoryStore {
       this.addColumnIfMissing('memories', 'content_hash', 'TEXT');
       this.db.exec('PRAGMA user_version = 1');
     }
+    if (current < 2) {
+      // ── Memory lifecycle columns ──
+      this.addColumnIfMissing('memories', 'status', "TEXT NOT NULL DEFAULT 'active'");
+      this.addColumnIfMissing('memories', 'review_reason', 'TEXT');
+      this.addColumnIfMissing('memories', 'reviewed_at', 'TEXT');
+
+      // ── Session ledger tables ──
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS session_prompts (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          raw_prompt TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          embedding BLOB
+        );
+
+        CREATE TABLE IF NOT EXISTS session_responses (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          prompt_id TEXT NOT NULL REFERENCES session_prompts(id),
+          full_response TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          embedding BLOB
+        );
+
+        CREATE TABLE IF NOT EXISTS session_tool_calls (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          prompt_id TEXT REFERENCES session_prompts(id),
+          response_id TEXT REFERENCES session_responses(id),
+          tool_name TEXT NOT NULL,
+          args_safe TEXT,
+          result_summary TEXT,
+          importance TEXT,
+          created_at TEXT NOT NULL,
+          embedding BLOB
+        );
+
+        CREATE TABLE IF NOT EXISTS session_summaries (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          prompt_id TEXT REFERENCES session_prompts(id),
+          response_id TEXT REFERENCES session_responses(id),
+          summary TEXT NOT NULL,
+          decisions TEXT,
+          key_titles TEXT,
+          memory_ids TEXT,
+          artifact_refs TEXT,
+          created_at TEXT NOT NULL,
+          embedding BLOB
+        );
+
+        CREATE TABLE IF NOT EXISTS session_memory_links (
+          prompt_id TEXT REFERENCES session_prompts(id),
+          response_id TEXT REFERENCES session_responses(id),
+          memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+          relation TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (prompt_id, response_id, memory_id, relation)
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_topics (
+          topic_key TEXT NOT NULL,
+          memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (topic_key, memory_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_prompts_session_id ON session_prompts(session_id);
+        CREATE INDEX IF NOT EXISTS idx_session_responses_session_id ON session_responses(session_id);
+        CREATE INDEX IF NOT EXISTS idx_session_responses_prompt_id ON session_responses(prompt_id);
+        CREATE INDEX IF NOT EXISTS idx_session_tool_calls_session_id ON session_tool_calls(session_id);
+        CREATE INDEX IF NOT EXISTS idx_session_summaries_session_id ON session_summaries(session_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_topics_memory_id ON memory_topics(memory_id);
+      `);
+
+      this.db.exec('PRAGMA user_version = 2');
+    }
+    if (current < 3) {
+      // ── Session ledger lifecycle (decay) columns ──
+      // Brings session_prompts / session_responses / session_tool_calls /
+      // session_summaries into the same retention/decay model as memories.
+      // Defaults are backfilled from existing created_at so legacy rows are
+      // "fresh" rather than NULL/empty after migration.
+      const sessionTables = [
+        'session_prompts', 'session_responses', 'session_tool_calls', 'session_summaries',
+      ];
+      for (const tbl of sessionTables) {
+        this.addColumnIfMissing(tbl, 'updated_at', 'TEXT');
+        this.addColumnIfMissing(tbl, 'access_count', 'INTEGER NOT NULL DEFAULT 0');
+        this.addColumnIfMissing(tbl, 'last_accessed_at', 'TEXT');
+        this.addColumnIfMissing(tbl, 'status', "TEXT NOT NULL DEFAULT 'active'");
+        // Backfill lifecycle defaults for pre-existing rows.
+        this.db.exec(`UPDATE ${tbl} SET updated_at = created_at WHERE updated_at IS NULL`);
+        this.db.exec(`UPDATE ${tbl} SET last_accessed_at = created_at WHERE last_accessed_at IS NULL`);
+      }
+
+      this.db.exec('PRAGMA user_version = 3');
+    }
   }
 
   private addColumnIfMissing(table: string, column: string, ddl: string): void {
@@ -189,38 +646,72 @@ export class SqliteMemoryStore implements MemoryStore {
   }
 
   close(): void {
-    this.db.close();
+    try {
+      this.db?.close();
+    } catch {
+      // Already closed or never opened — ignore.
+    }
   }
 
   // ── Storage ──────────────────────────────────────────────────────
 
-  async store(request: StoreRequest & { id?: string }): Promise<Memory> {
+  async store(request: StoreRequest): Promise<Memory> {
     const now = new Date().toISOString();
-    const id = (request as any).id ?? randomUUID();
+    const id = request.id ?? randomUUID();
     const tags = JSON.stringify(request.tags ?? []);
     const embedding = await this.embedder.embed(request.content);
     const provenance = request.provenance;
+    const requestedStatus = request.status; // undefined → leave existing status untouched on conflict
 
     this.db.exec('BEGIN');
     try {
-      this.db.prepare(
-        `INSERT INTO memories
+      // Step 1 — try a fresh INSERT. OR IGNORE leaves the existing row untouched
+      // on conflict so we can apply the merge rules explicitly below.
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO memories
           (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version,
-           origin, source_tool, session_id, content_hash)
+           origin, source_tool, session_id, content_hash, status)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           content        = excluded.content,
-           category       = excluded.category,
-           tags           = excluded.tags,
-           updated_at     = excluded.updated_at`,
+                ?, ?, ?, ?, ?)`,
       ).run(
         id, request.content, request.category, tags, now, now, 0, now, 1,
         provenance?.origin ?? 'unknown',
         provenance?.sourceTool ?? null,
         provenance?.sessionId ?? null,
         provenance?.contentHash ?? null,
+        requestedStatus ?? 'active',
       );
+
+      if (insert.changes === 0) {
+        // Step 2 — conflict: upsert with safe merge rules.
+        //   • created_at is NOT in the SET clause → preserved.
+        //   • version increments (never resets).
+        //   • provenance fields use COALESCE(NULL → keep existing).
+        //   • status only changes when the caller explicitly provided one.
+        this.db.prepare(
+          `UPDATE memories SET
+             content      = ?,
+             category     = ?,
+             tags         = ?,
+             updated_at   = ?,
+             version      = version + 1,
+             origin       = COALESCE(?, origin),
+             source_tool  = COALESCE(?, source_tool),
+             session_id   = COALESCE(?, session_id),
+             content_hash = COALESCE(?, content_hash),
+             status       = CASE WHEN ? IS NOT NULL THEN ? ELSE status END
+           WHERE id = ?`,
+        ).run(
+          request.content, request.category, tags, now,
+          provenance?.origin ?? null,
+          provenance?.sourceTool ?? null,
+          provenance?.sessionId ?? null,
+          provenance?.contentHash ?? null,
+          requestedStatus ?? null,
+          requestedStatus ?? null,
+          id,
+        );
+      }
 
       this.db.prepare(
         `INSERT OR REPLACE INTO memory_embeddings (id, embedding) VALUES (?, ?)`,
@@ -232,16 +723,19 @@ export class SqliteMemoryStore implements MemoryStore {
       throw e;
     }
 
-    return {
-      id,
-      content: request.content,
-      category: request.category,
-      tags: request.tags ?? [],
-      createdAt: now,
-      updatedAt: now,
-      version: 1,
-      ...(provenance ? { provenance } : {}),
-    };
+    // Auto-create / refresh topic alias when requested (best-effort, post-commit).
+    if (request.topicKey) {
+      await this.upsertTopicAlias(request.topicKey, id);
+    }
+
+    // Auto-link this memory to the active session's most recent prompt
+    // (best-effort, fire-and-forget). No-op when no session context is set.
+    this.autoLinkToActiveSession(id);
+
+    // Read back the canonical row so created_at (preserved), version
+    // (incremented), status, and provenance all reflect truth.
+    const row = this.db.prepare(`SELECT * FROM memories WHERE id = ?`).get(id) as unknown as MemoryRow;
+    return rowToMemory(row);
   }
 
   async storeBatch(memories: StoreRequest[]): Promise<Memory[]> {
@@ -318,6 +812,37 @@ export class SqliteMemoryStore implements MemoryStore {
     this.db.prepare(
       'UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?',
     ).run(new Date().toISOString(), id);
+  }
+
+  /**
+   * Bump access_count + last_accessed_at for session-ledger rows read through
+   * supported retrieval paths (getSession). One UPDATE per (table, id) so only
+   * the exact rows returned are touched. Best-effort: never throws.
+   */
+  private touchSessionAccess(
+    promptIds: string[],
+    responseIds: string[],
+    toolCallIds: string[],
+    summaryIds: string[],
+  ): void {
+    const now = new Date().toISOString();
+    const tables: Array<[string, string[]]> = [
+      ['session_prompts', promptIds],
+      ['session_responses', responseIds],
+      ['session_tool_calls', toolCallIds],
+      ['session_summaries', summaryIds],
+    ];
+    try {
+      for (const [table, ids] of tables) {
+        if (ids.length === 0) continue;
+        const placeholders = ids.map(() => '?').join(',');
+        this.db.prepare(
+          `UPDATE ${table} SET access_count = access_count + 1, last_accessed_at = ? WHERE id IN (${placeholders})`,
+        ).run(now, ...ids);
+      }
+    } catch {
+      // Access tracking must never fail a read.
+    }
   }
 
   // ── Search ────────────────────────────────────────────────────────
@@ -542,6 +1067,176 @@ export class SqliteMemoryStore implements MemoryStore {
     return this._hybridSearchCore(query, filters, limit);
   }
 
+  // ── Unified session search (PR 1) ─────────────────────────────────
+
+  /**
+   * Compacted-first unified search over the session ledger.
+   *
+   * Searches compacted summaries first; raw prompt/response/tool-call rows are
+   * opt-in via `includeRawSessionItems`. Each candidate is scored by a keyword
+   * signal (token overlap) and a semantic signal (cosine over the stored
+   * embedding), fused with RRF. With `sourceBalancing` on, results are
+   * interleaved round-robin across sources so verbose raw rows cannot crowd out
+   * dense summaries. PR 1 fixes sourceMultiplier and accessMultiplier at 1 (no
+   * decay scoring yet — that is PR 2).
+   */
+  async searchSessions(query: UnifiedSearchQuery): Promise<SessionSearchResult[]> {
+    const q = parseSearchQuery(query);
+
+    // Resolve which session sources to scan: summaries always (compacted-first);
+    // raw rows only when opted in. Honor an explicit `sources` filter too.
+    const requested = new Set(q.sources);
+    const sources: UnifiedSearchSource[] = [];
+    for (const s of COMPACTED_SESSION_SOURCES) {
+      if (requested.has(s)) sources.push(s);
+    }
+    if (q.includeRawSessionItems) {
+      for (const s of RAW_SESSION_SOURCES) {
+        if (requested.has(s)) sources.push(s);
+      }
+    }
+    if (sources.length === 0) return [];
+
+    const queryVec = await this.embedder.embed(q.query);
+    const tokens = q.query.toLowerCase().split(/\s+/).filter(Boolean);
+
+    // Collect scored candidates per source so balancing can interleave them.
+    const perSource = new Map<UnifiedSearchSource, ScoredSessionCandidate[]>();
+    for (const source of sources) {
+      perSource.set(source, this.scoreSessionSource(source, q, tokens, queryVec));
+    }
+
+    const ordered = q.sourceBalancing
+      ? interleaveBalanced(sources, perSource)
+      : flattenByScore(sources, perSource);
+
+    return ordered
+      .slice(0, q.limit)
+      .map(c => this.toSessionSearchResult(c, q));
+  }
+
+  /**
+   * Score every active row of one session source against the query. Returns the
+   * candidates sorted best-first (RRF over keyword + semantic ranks).
+   */
+  private scoreSessionSource(
+    source: UnifiedSearchSource,
+    q: ResolvedSearchQuery,
+    tokens: string[],
+    queryVec: number[],
+  ): ScoredSessionCandidate[] {
+    const meta = SESSION_SOURCE_META[source];
+    if (!meta) return [];
+
+    const where: string[] = [];
+    const args: string[] = [];
+    // Status: 'all' disables the filter; otherwise match the requested status.
+    if (q.status !== 'all') {
+      where.push('status = ?');
+      args.push(q.status);
+    }
+    if (q.sessionId) {
+      where.push('session_id = ?');
+      args.push(q.sessionId);
+    }
+    if (q.after) {
+      where.push('created_at >= ?');
+      args.push(q.after);
+    }
+    if (q.before) {
+      where.push('created_at <= ?');
+      args.push(q.before);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const rows = this.db.prepare(
+      `SELECT id, session_id, ${meta.contentCol} AS content, created_at, status, embedding
+       FROM ${meta.table} ${whereSql}`,
+    ).all(...args) as unknown as SessionCandidateRow[];
+
+    // Compute keyword (token overlap) and semantic (cosine) scores.
+    const scored = rows.map(row => {
+      const content = row.content ?? '';
+      const lower = content.toLowerCase();
+      const keywordScore = tokens.length
+        ? tokens.reduce((n, t) => (lower.includes(t) ? n + 1 : n), 0) / tokens.length
+        : 0;
+      const semanticScore = row.embedding
+        ? cosineDistance(queryVec, blobToEmbedding(row.embedding))
+        : 0;
+      return { row, source, content, keywordScore, semanticScore };
+    });
+
+    // Keep only rows with some signal so empty-keyword + zero-vector noise drops.
+    const candidates = scored.filter(s => s.keywordScore > 0 || s.semanticScore > 0);
+
+    const kwRanked = [...candidates].sort((a, b) => b.keywordScore - a.keywordScore);
+    const semRanked = [...candidates].sort((a, b) => b.semanticScore - a.semanticScore);
+    const kwRank = new Map(kwRanked.map((c, i) => [c.row.id, i]));
+    const semRank = new Map(semRanked.map((c, i) => [c.row.id, i]));
+
+    const fused = rrf([
+      kwRanked.map(c => ({ id: c.row.id, score: c.keywordScore })),
+      semRanked.map(c => ({ id: c.row.id, score: c.semanticScore })),
+    ]);
+    const byId = new Map(candidates.map(c => [c.row.id, c]));
+
+    return fused
+      .map(({ id, score }) => {
+        const c = byId.get(id)!;
+        return {
+          ...c,
+          score,
+          keywordRank: kwRank.get(id) ?? -1,
+          semanticRank: semRank.get(id) ?? -1,
+        } as ScoredSessionCandidate;
+      })
+      .filter(Boolean);
+  }
+
+  /** Map a scored candidate to the public SessionSearchResult shape. */
+  private toSessionSearchResult(
+    c: ScoredSessionCandidate,
+    q: ResolvedSearchQuery,
+  ): SessionSearchResult {
+    const meta = SESSION_SOURCE_META[c.source]!;
+    const decayFactor = scoreSessionRow({
+      updated_at: c.row.created_at,
+      access_count: 0,
+      last_accessed_at: c.row.created_at,
+    });
+    const hint = generateDecisionHint(c.content, c.score, q.maxContentChars);
+
+    const result: SessionSearchResult = {
+      id: c.row.id,
+      source: c.source,
+      contentRef: `${c.source}:${c.row.id}`,
+      decisionHint: hint,
+      score: c.score,
+      status: c.row.status ?? 'active',
+      createdAt: c.row.created_at,
+      sessionId: c.row.session_id,
+      isCompact: meta.isCompact,
+    };
+    if (q.includeContent) {
+      result.content = c.content.length > q.maxContentChars
+        ? c.content.slice(0, q.maxContentChars)
+        : c.content;
+    }
+    if (q.explain) {
+      const explain: UnifiedSearchExplain = {
+        keywordRank: c.keywordRank,
+        semanticCosine: c.semanticScore,
+        sourceMultiplier: 1,
+        decayFactor,
+        accessMultiplier: 1,
+        finalScore: c.score,
+      };
+      result.explain = explain;
+    }
+    return result;
+  }
+
   private applyFiltersAndDecay(
     rows: MemoryRow[],
     filters: SearchFilters,
@@ -564,7 +1259,18 @@ export class SqliteMemoryStore implements MemoryStore {
       filtered = filtered.filter(r => {
         const tags: string[] = JSON.parse(r.tags);
         return filters.tags!.some(t => tags.includes(t));
-      });
+      }
+      );
+    }
+
+    // Status filter: 'all' = no filter; a specific status = match only that;
+    // undefined (default) = exclude 'archived'.
+    if (filters.status === 'all') {
+      // no filtering
+    } else if (filters.status) {
+      filtered = filtered.filter(r => (r.status ?? 'active') === filters.status);
+    } else {
+      filtered = filtered.filter(r => (r.status ?? 'active') !== 'archived');
     }
 
     const results = filtered
@@ -601,14 +1307,18 @@ export class SqliteMemoryStore implements MemoryStore {
   // ── listRecent() ──────────────────────────────────────────────────
 
   async listRecent(limit: number = 10, category?: MemoryCategory): Promise<Memory[]> {
+    // Spec (memory-lifecycle.md): list_recent MUST exclude archived by default.
+    // There is no `status` filter parameter on this method, so we always
+    // hide archived rows here — callers wanting archived memories must use
+    // search() with status: 'all' or status: 'archived'.
     let rows: MemoryRow[];
     if (category) {
       rows = this.db.prepare(
-        `SELECT * FROM memories WHERE category = ? ORDER BY created_at DESC LIMIT ?`,
+        `SELECT * FROM memories WHERE category = ? AND (status IS NULL OR status != 'archived') ORDER BY created_at DESC LIMIT ?`,
       ).all(category, limit) as unknown as MemoryRow[];
     } else {
       rows = this.db.prepare(
-        `SELECT * FROM memories ORDER BY created_at DESC LIMIT ?`,
+        `SELECT * FROM memories WHERE (status IS NULL OR status != 'archived') ORDER BY created_at DESC LIMIT ?`,
       ).all(limit) as unknown as MemoryRow[];
     }
     return rows.map(rowToMemory);
@@ -682,6 +1392,15 @@ export class SqliteMemoryStore implements MemoryStore {
       ).get(id) as unknown as MemoryRow;
 
       this.db.exec('COMMIT');
+
+      // Auto-link the updated memory to the active session's most recent prompt
+      // (best-effort, fire-and-forget). No-op when no session context is set.
+      try {
+        this.autoLinkToActiveSession(id);
+      } catch {
+        // Swallow: auto-link must never fail the update.
+      }
+
       return rowToMemory(updated);
     } catch (e) {
       try {
@@ -822,5 +1541,491 @@ export class SqliteMemoryStore implements MemoryStore {
       dryRun,
       candidates,
     };
+  }
+
+  // ── Topic aliases (PR-1: implemented; needed by store() topicKey wiring) ──
+
+  async upsertTopicAlias(topicKey: string, memoryId: string): Promise<void> {
+    const now = new Date().toISOString();
+    // The memory_topics table ships with a composite PRIMARY KEY
+    // (topic_key, memory_id) from PR-1's migration v2. Spec semantics
+    // require that re-aliasing an existing topic_key to a NEW memory
+    // replaces the previous target (resolveTopic returns one memory).
+    // Composite-PK ON CONFLICT cannot do that in-place, so we
+    // DELETE-then-INSERT inside an explicit transaction. This is
+    // idempotent and avoids introducing a v3 migration.
+    this.db.exec('BEGIN');
+    try {
+      this.db.prepare(`DELETE FROM memory_topics WHERE topic_key = ?`).run(topicKey);
+      this.db.prepare(
+        `INSERT INTO memory_topics (topic_key, memory_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      ).run(topicKey, memoryId, now, now);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* ignore */ }
+      throw err;
+    }
+  }
+
+  async resolveTopic(topicKey: string): Promise<Memory | null> {
+    const row = this.db.prepare(
+      `SELECT m.*
+       FROM memory_topics t
+       JOIN memories m ON m.id = t.memory_id
+       WHERE t.topic_key = ?
+       ORDER BY t.updated_at DESC
+       LIMIT 1`,
+    ).get(topicKey) as unknown as MemoryRow | undefined;
+
+    return row ? rowToMemory(row) : null;
+  }
+
+  // ── Session context (in-memory; PR-1 foundation) ──────────────────
+
+  setSessionContext(sessionId: string, projectId: string): void {
+    this.sessionContext = { sessionId, projectId };
+  }
+
+  getSessionContext(): { sessionId: string; projectId: string } | null {
+    return this.sessionContext;
+  }
+
+  // ── Lifecycle status transitions (T-003 / PR-2) ──────────────────────
+
+  async updateMemoryStatus(id: string, status: MemoryStatus, reviewReason?: string): Promise<Memory> {
+    const existing = this.db.prepare(
+      `SELECT status FROM memories WHERE id = ?`,
+    ).get(id) as { status: string | null } | undefined;
+
+    if (!existing) throw new MemoryNotFoundError(id);
+
+    const current = (existing.status ?? 'active') as MemoryStatus;
+    this.validateStatusTransition(current, status, reviewReason);
+
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `UPDATE memories
+       SET status = ?, review_reason = ?, reviewed_at = ?, updated_at = ?, version = version + 1
+       WHERE id = ?`,
+    ).run(status, reviewReason ?? null, now, now, id);
+
+    const row = this.db.prepare(`SELECT * FROM memories WHERE id = ?`).get(id) as unknown as MemoryRow;
+    return rowToMemory(row);
+  }
+
+  /**
+   * Validate a lifecycle transition.
+   *
+   * Rules:
+   *   • active → needs_review      : always allowed
+   *   • active → archived          : requires reviewReason
+   *   • needs_review → active      : requires reviewReason
+   *   • needs_review → archived    : always allowed
+   *   • archived → *               : NOT allowed (use store() with new content)
+   *   • same → same                : allowed (updates reason/reviewed_at)
+   *
+   * Throws a descriptive Error on any illegal transition.
+   */
+  private validateStatusTransition(from: MemoryStatus, to: MemoryStatus, reason?: string): void {
+    if (from === to) return; // idempotent / metadata-only update
+
+    if (from === 'archived') {
+      throw new Error(
+        `Invalid status transition: 'archived' is terminal. ` +
+        `Cannot move to '${to}'. Use store() with new content to create a fresh memory.`,
+      );
+    }
+
+    const needsReason = (from === 'active' && to === 'archived') ||
+                        (from === 'needs_review' && to === 'active');
+    if (needsReason && !reason) {
+      throw new Error(
+        `Invalid status transition: '${from}' → '${to}' requires a reviewReason.`,
+      );
+    }
+
+    // All remaining transitions (active→needs_review, needs_review→archived) are valid.
+  }
+
+  // ── Session ledger store methods (T-004 / PR-2) ──────────────────────
+
+  async storeSessionPrompt(sessionId: string, rawPrompt: string): Promise<SessionPrompt> {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const embedding = await this.embedder.embed(rawPrompt);
+
+    this.db.prepare(
+      `INSERT INTO session_prompts (id, session_id, raw_prompt, created_at, updated_at, access_count, last_accessed_at, status, embedding)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, sessionId, rawPrompt, now, now, 0, now, 'active', embeddingToBlob(embedding));
+
+    return { id, sessionId, rawPrompt, createdAt: now, updatedAt: now, accessCount: 0, lastAccessedAt: now, status: 'active' };
+  }
+
+  async storeSessionResponse(sessionId: string, promptId: string, fullResponse: string): Promise<SessionResponse> {
+    // Validate the prompt exists — gives a clear error instead of a raw FK violation.
+    const prompt = this.db.prepare(
+      `SELECT 1 AS ok FROM session_prompts WHERE id = ?`,
+    ).get(promptId);
+    if (!prompt) {
+      throw new Error(`Prompt not found: ${promptId} (cannot store response)`);
+    }
+
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const embedding = await this.embedder.embed(fullResponse);
+
+    this.db.prepare(
+      `INSERT INTO session_responses (id, session_id, prompt_id, full_response, created_at, updated_at, access_count, last_accessed_at, status, embedding)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(id, sessionId, promptId, fullResponse, now, now, 0, now, 'active', embeddingToBlob(embedding));
+
+    return { id, sessionId, promptId, fullResponse, createdAt: now, updatedAt: now, accessCount: 0, lastAccessedAt: now, status: 'active' };
+  }
+
+  async storeSessionToolCall(params: {
+    sessionId: string;
+    promptId?: string;
+    responseId?: string;
+    toolName: string;
+    argsSafe?: string;
+    resultSummary?: string;
+    importance?: string;
+  }): Promise<SessionToolCall> {
+    if (params.importance && !['low', 'normal', 'high'].includes(params.importance)) {
+      throw new Error(
+        `Invalid importance '${params.importance}': must be 'low', 'normal', or 'high'`,
+      );
+    }
+
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    // Embed from the richest available text for downstream semantic lookups.
+    const embedText = params.resultSummary || params.toolName;
+    const embedding = await this.embedder.embed(embedText);
+
+    this.db.prepare(
+      `INSERT INTO session_tool_calls
+         (id, session_id, prompt_id, response_id, tool_name, args_safe, result_summary, importance, created_at, updated_at, access_count, last_accessed_at, status, embedding)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id, params.sessionId, params.promptId ?? null, params.responseId ?? null,
+      params.toolName, params.argsSafe ?? null, params.resultSummary ?? null,
+      params.importance ?? null, now, now, 0, now, 'active', embeddingToBlob(embedding),
+    );
+
+    const result: SessionToolCall = {
+      id,
+      sessionId: params.sessionId,
+      toolName: params.toolName,
+      createdAt: now,
+      updatedAt: now,
+      accessCount: 0,
+      lastAccessedAt: now,
+      status: 'active',
+    };
+    if (params.promptId) result.promptId = params.promptId;
+    if (params.responseId) result.responseId = params.responseId;
+    if (params.argsSafe) result.argsSafe = params.argsSafe;
+    if (params.resultSummary) result.resultSummary = params.resultSummary;
+    if (params.importance) result.importance = params.importance;
+    return result;
+  }
+
+  async storeSessionSummary(params: {
+    sessionId: string;
+    promptId?: string;
+    responseId?: string;
+    summary: string;
+    decisions?: string[];
+    keyTitles?: string[];
+    memoryIds?: string[];
+    artifactRefs?: string[];
+  }): Promise<SessionSummary> {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const decisions = params.decisions ?? [];
+    // Embed from summary + decisions so the summary is retrievable by either signal.
+    const embedText = `${params.summary} ${decisions.join(' ')}`.trim();
+    const embedding = await this.embedder.embed(embedText);
+
+    this.db.prepare(
+      `INSERT INTO session_summaries
+         (id, session_id, prompt_id, response_id, summary, decisions, key_titles, memory_ids, artifact_refs, created_at, updated_at, access_count, last_accessed_at, status, embedding)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id, params.sessionId, params.promptId ?? null, params.responseId ?? null,
+      params.summary,
+      params.decisions ? JSON.stringify(params.decisions) : null,
+      params.keyTitles ? JSON.stringify(params.keyTitles) : null,
+      params.memoryIds ? JSON.stringify(params.memoryIds) : null,
+      params.artifactRefs ? JSON.stringify(params.artifactRefs) : null,
+      now, now, 0, now, 'active', embeddingToBlob(embedding),
+    );
+
+    const result: SessionSummary = {
+      id,
+      sessionId: params.sessionId,
+      summary: params.summary,
+      createdAt: now,
+      updatedAt: now,
+      accessCount: 0,
+      lastAccessedAt: now,
+      status: 'active',
+    };
+    if (params.promptId) result.promptId = params.promptId;
+    if (params.responseId) result.responseId = params.responseId;
+    if (params.decisions) result.decisions = params.decisions;
+    if (params.keyTitles) result.keyTitles = params.keyTitles;
+    if (params.memoryIds) result.memoryIds = params.memoryIds;
+    if (params.artifactRefs) result.artifactRefs = params.artifactRefs;
+    return result;
+  }
+
+  async getSession(
+    sessionId: string,
+    opts?: { limit?: number; includeSummary?: boolean; includeForgotten?: boolean },
+  ): Promise<SessionLedger> {
+    const limit = opts?.limit;
+    const limitClause = limit !== undefined ? ' LIMIT ?' : '';
+    const limitArgs = limit !== undefined ? [limit] : [];
+    // Spec (session-ledger.md): forgotten rows are excluded by default and
+    // only surfaced when includeForgotten is explicitly true.
+    const statusFilter = opts?.includeForgotten
+      ? ''
+      : `AND (status IS NULL OR status != 'forgotten')`;
+
+    const promptRows = this.db.prepare(
+      `SELECT id, session_id, raw_prompt, created_at, updated_at, access_count, last_accessed_at, status FROM session_prompts
+       WHERE session_id = ? ${statusFilter} ORDER BY created_at ASC${limitClause}`,
+    ).all(sessionId, ...limitArgs) as unknown as SessionPromptRow[];
+
+    const responseRows = this.db.prepare(
+      `SELECT id, session_id, prompt_id, full_response, created_at, updated_at, access_count, last_accessed_at, status FROM session_responses
+       WHERE session_id = ? ${statusFilter} ORDER BY created_at ASC${limitClause}`,
+    ).all(sessionId, ...limitArgs) as unknown as SessionResponseRow[];
+
+    const toolCallRows = this.db.prepare(
+      `SELECT id, session_id, prompt_id, response_id, tool_name, args_safe, result_summary, importance, created_at, updated_at, access_count, last_accessed_at, status
+       FROM session_tool_calls WHERE session_id = ? ${statusFilter} ORDER BY created_at ASC${limitClause}`,
+    ).all(sessionId, ...limitArgs) as unknown as SessionToolCallRow[];
+
+    // includeSummary defaults to true; skip the summary query only when explicitly false.
+    const summaryRows: SessionSummaryRow[] = opts?.includeSummary === false
+      ? []
+      : this.db.prepare(
+          `SELECT id, session_id, prompt_id, response_id, summary, decisions, key_titles, memory_ids, artifact_refs, created_at, updated_at, access_count, last_accessed_at, status
+           FROM session_summaries WHERE session_id = ? ${statusFilter} ORDER BY created_at ASC${limitClause}`,
+        ).all(sessionId, ...limitArgs) as unknown as SessionSummaryRow[];
+
+    // Spec (session-ledger-decay.md): supported reads MUST update access_count
+    // and last_accessed_at. We bump every returned row once per call
+    // (best-effort; never throws on the read path).
+    this.touchSessionAccess(
+      promptRows.map(r => r.id),
+      responseRows.map(r => r.id),
+      toolCallRows.map(r => r.id),
+      summaryRows.map(r => r.id),
+    );
+
+    return {
+      sessionId,
+      prompts: promptRows.map(rowToSessionPrompt),
+      responses: responseRows.map(rowToSessionResponse),
+      toolCalls: toolCallRows.map(rowToSessionToolCall),
+      summaries: summaryRows.map(rowToSessionSummary),
+    };
+  }
+
+  async listSessions(limit?: number): Promise<SessionMeta[]> {
+    const limitClause = limit !== undefined ? ' LIMIT ?' : '';
+    const limitArgs = limit !== undefined ? [limit] : [];
+
+    // Derive distinct sessions across all four ledger tables, with the most
+    // recent activity timestamp. Join against session_prompts to compute the
+    // per-session prompt count (SessionMeta.promptCount).
+    const rows = this.db.prepare(
+      `SELECT
+         activity.session_id AS session_id,
+         COALESCE(p.prompt_count, 0) AS prompt_count,
+         activity.last_activity AS last_activity
+       FROM (
+         SELECT session_id, MAX(created_at) AS last_activity
+         FROM (
+           SELECT session_id, created_at FROM session_prompts
+           UNION ALL
+           SELECT session_id, created_at FROM session_responses
+           UNION ALL
+           SELECT session_id, created_at FROM session_tool_calls
+           UNION ALL
+           SELECT session_id, created_at FROM session_summaries
+         )
+         GROUP BY session_id
+       ) activity
+       LEFT JOIN (
+         SELECT session_id, COUNT(*) AS prompt_count
+         FROM session_prompts
+         GROUP BY session_id
+       ) p ON p.session_id = activity.session_id
+       ORDER BY activity.last_activity DESC${limitClause}`,
+    ).all(...limitArgs) as Array<{ session_id: string; prompt_count: number; last_activity: string }>;
+
+    return rows.map(r => ({
+      sessionId: r.session_id,
+      promptCount: r.prompt_count,
+      lastActivity: r.last_activity,
+    }));
+  }
+
+  async linkPromptToMemory(
+    promptId: string,
+    memoryId: string,
+    relation: string,
+    responseId?: string,
+  ): Promise<void> {
+    const now = new Date().toISOString();
+    const rid = responseId ?? null;
+    // Use INSERT ... WHERE NOT EXISTS with NULL-safe IS comparison so that
+    // repeated calls (including with a NULL responseId) do not create
+    // duplicate rows — SQLite treats NULL ≠ NULL inside a PRIMARY KEY, so a
+    // naive INSERT OR IGNORE would not dedup NULL response_id links.
+    this.db.prepare(
+      `INSERT INTO session_memory_links (prompt_id, response_id, memory_id, relation, created_at)
+       SELECT ?, ?, ?, ?, ?
+       WHERE NOT EXISTS (
+         SELECT 1 FROM session_memory_links
+         WHERE prompt_id = ? AND memory_id = ? AND relation = ? AND response_id IS ?
+       )`,
+    ).run(
+      promptId, rid, memoryId, relation, now,
+      promptId, memoryId, relation, rid,
+    );
+  }
+
+  // ── Session decay: forget / purge by id ─────────────────────────────
+
+  /**
+   * Detect which session-ledger table holds a given id. Returns the entity
+   * type ('prompt' | 'response' | 'tool_call' | 'summary') plus the table
+   * name, or null when the id matches no session entity.
+   *
+   * Throws when the same id appears in more than one table (ambiguous): the
+   * caller must refuse to mutate because the target row cannot be uniquely
+   * identified. In practice ids are randomUUID() so collisions are
+   * astronomically unlikely, but the guard keeps the contract safe.
+   */
+  private detectSessionEntity(id: string): { type: SessionItemType; table: string } {
+    const checks: Array<{ type: SessionItemType; table: string }> = [
+      { type: 'prompt', table: 'session_prompts' },
+      { type: 'response', table: 'session_responses' },
+      { type: 'tool_call', table: 'session_tool_calls' },
+      { type: 'summary', table: 'session_summaries' },
+    ];
+    const hits: Array<{ type: SessionItemType; table: string }> = [];
+    for (const c of checks) {
+      const row = this.db.prepare(`SELECT 1 AS ok FROM ${c.table} WHERE id = ?`).get(id);
+      if (row) hits.push(c);
+    }
+    if (hits.length === 0) {
+      throw new Error(`NOT_FOUND: no session entity with id ${id}`);
+    }
+    if (hits.length > 1) {
+      throw new Error(
+        `AMBIGUOUS: id ${id} matches multiple session tables (${hits.map(h => h.type).join(', ')}); refusing to delete`,
+      );
+    }
+    return hits[0];
+  }
+
+  /**
+   * Soft-forget a session-ledger record by id (sets status='forgotten').
+   * Spec (session-forget.md): returns { type, success }. Forgotten rows are
+   * hidden from default getSession/search retrieval but remain recoverable
+   * until explicitly purged.
+   */
+  async forgetSessionItem(id: string): Promise<SessionForgetResult> {
+    const { type } = this.detectSessionEntity(id);
+    const tables: Record<SessionItemType, string> = {
+      prompt: 'session_prompts',
+      response: 'session_responses',
+      tool_call: 'session_tool_calls',
+      summary: 'session_summaries',
+    };
+    const now = new Date().toISOString();
+    const res = this.db.prepare(
+      `UPDATE ${tables[type]} SET status = 'forgotten', updated_at = ? WHERE id = ?`,
+    ).run(now, id) as { changes: number };
+    return { type, success: res.changes > 0 };
+  }
+
+  /**
+   * Hard-purge a session-ledger record by id — permanently deletes the row
+   * (including its embedding column). Spec (session-forget.md): explicit
+   * destructive path; never runs automatically through decay/maintenance.
+   * Returns { type, success }.
+   *
+   * Inter-table references between session rows are non-cascading by design,
+   * so to honour "delete only the intended item" the explicit destructive
+   * path relaxes FK enforcement for this single DELETE. Dependents are left
+   * in place (they become orphans rather than being cascade-removed).
+   */
+  async purgeSessionItem(id: string): Promise<SessionPurgeResult> {
+    const { type, table } = this.detectSessionEntity(id);
+    const fkWasOn =
+      (this.db.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys === 1;
+    if (fkWasOn) this.db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      const res = this.db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id) as { changes: number };
+      return { type, success: res.changes > 0 };
+    } finally {
+      if (fkWasOn) this.db.exec('PRAGMA foreign_keys = ON');
+    }
+  }
+
+  // ── Auto-link helper (T-004 / PR-2) ──────────────────────────────────
+
+  /**
+   * Fire-and-forget: when a session context is active, link the just-stored /
+   * just-updated memory to the most recent prompt (and its most recent
+   * response, if any) in that session. Never throws — callers (store/update)
+   * must not fail because of auto-linking.
+   */
+  private autoLinkToActiveSession(memoryId: string): void {
+    const ctx = this.sessionContext;
+    if (!ctx) return;
+
+    try {
+      // ORDER BY created_at DESC, rowid DESC: deterministic tiebreaker when
+      // multiple prompts share a millisecond timestamp (MockEmbedder is sub-ms).
+      // rowid is monotonic with insertion order, so the last-inserted row wins.
+      const prompt = this.db.prepare(
+        `SELECT id FROM session_prompts WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      ).get(ctx.sessionId) as { id: string } | undefined;
+
+      if (!prompt) return; // nothing to link to
+
+      const response = this.db.prepare(
+        `SELECT id FROM session_responses WHERE prompt_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      ).get(prompt.id) as { id: string } | undefined;
+
+      // linkPromptToMemory is sync internally; call it directly (not via the
+      // async interface wrapper) since we are already inside a sync helper.
+      const now = new Date().toISOString();
+      const rid = response?.id ?? null;
+      this.db.prepare(
+        `INSERT INTO session_memory_links (prompt_id, response_id, memory_id, relation, created_at)
+         SELECT ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (
+           SELECT 1 FROM session_memory_links
+           WHERE prompt_id = ? AND memory_id = ? AND relation = ? AND response_id IS ?
+         )`,
+      ).run(
+        prompt.id, rid, memoryId, 'created_from', now,
+        prompt.id, memoryId, 'created_from', rid,
+      );
+    } catch {
+      // Best-effort: swallow so store()/update() callers are unaffected.
+    }
   }
 }

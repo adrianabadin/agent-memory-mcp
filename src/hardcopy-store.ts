@@ -3,6 +3,7 @@ import { join } from 'path';
 import type {
   Memory,
   MemoryCategory,
+  MemoryStatus,
   MemoryStore,
   MemoryStats,
   PruneOptions,
@@ -10,6 +11,14 @@ import type {
   SearchFilters,
   SearchMode,
   SearchResult,
+  SessionForgetResult,
+  SessionLedger,
+  SessionMeta,
+  SessionPrompt,
+  SessionPurgeResult,
+  SessionResponse,
+  SessionSummary,
+  SessionToolCall,
   StoreRequest,
   UpdateRequest,
 } from './types.js';
@@ -80,6 +89,87 @@ export class HardcopyMemoryStore implements MemoryStore {
 
   async prune(options: PruneOptions): Promise<PruneResult> {
     return this.inner.prune(options);
+  }
+
+  // ── New PR-1 surface: pure delegation ───────────────────────
+  //
+  // Session-ledger hardcopy mirroring is intentionally deferred to T-007
+  // (PR-4); for PR-1 these methods simply delegate so the decorator
+  // satisfies the MemoryStore interface and stays transparent.
+
+  async updateMemoryStatus(id: string, status: MemoryStatus, reviewReason?: string): Promise<Memory> {
+    const memory = await this.inner.updateMemoryStatus(id, status, reviewReason);
+    await this.writeHardcopy(memory);
+    return memory;
+  }
+
+  async upsertTopicAlias(topicKey: string, memoryId: string): Promise<void> {
+    return this.inner.upsertTopicAlias(topicKey, memoryId);
+  }
+
+  async resolveTopic(topicKey: string): Promise<Memory | null> {
+    return this.inner.resolveTopic(topicKey);
+  }
+
+  async storeSessionPrompt(sessionId: string, rawPrompt: string): Promise<SessionPrompt> {
+    return this.inner.storeSessionPrompt(sessionId, rawPrompt);
+  }
+
+  async storeSessionResponse(sessionId: string, promptId: string, fullResponse: string): Promise<SessionResponse> {
+    return this.inner.storeSessionResponse(sessionId, promptId, fullResponse);
+  }
+
+  async storeSessionToolCall(params: {
+    sessionId: string;
+    promptId?: string;
+    responseId?: string;
+    toolName: string;
+    argsSafe?: string;
+    resultSummary?: string;
+    importance?: string;
+  }): Promise<SessionToolCall> {
+    return this.inner.storeSessionToolCall(params);
+  }
+
+  async storeSessionSummary(params: {
+    sessionId: string;
+    promptId?: string;
+    responseId?: string;
+    summary: string;
+    decisions?: string[];
+    keyTitles?: string[];
+    memoryIds?: string[];
+    artifactRefs?: string[];
+  }): Promise<SessionSummary> {
+    return this.inner.storeSessionSummary(params);
+  }
+
+  async getSession(sessionId: string, opts?: { limit?: number; includeSummary?: boolean; includeForgotten?: boolean }): Promise<SessionLedger> {
+    return this.inner.getSession(sessionId, opts);
+  }
+
+  async listSessions(limit?: number): Promise<SessionMeta[]> {
+    return this.inner.listSessions(limit);
+  }
+
+  async linkPromptToMemory(promptId: string, memoryId: string, relation: string, responseId?: string): Promise<void> {
+    return this.inner.linkPromptToMemory(promptId, memoryId, relation, responseId);
+  }
+
+  async forgetSessionItem(id: string): Promise<SessionForgetResult> {
+    return this.inner.forgetSessionItem(id);
+  }
+
+  async purgeSessionItem(id: string): Promise<SessionPurgeResult> {
+    return this.inner.purgeSessionItem(id);
+  }
+
+  setSessionContext(sessionId: string, projectId: string): void {
+    this.inner.setSessionContext(sessionId, projectId);
+  }
+
+  getSessionContext(): { sessionId: string; projectId: string } | null {
+    return this.inner.getSessionContext();
   }
 
   // ── Private ─────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Embedder } from '../types.js';
+import type { Embedder, MergeResult } from '../types.js';
 import { ProjectRegistry, type ProjectRecord, type ProjectMetadata } from './project-registry.js';
 import { ErrorStore, type ErrorRecord, type RecordErrorRequest, type ErrorSearchResult } from './error-store.js';
 
@@ -12,6 +12,7 @@ export interface GlobalStore {
   syncMetadata(projectId: string, metadata: Partial<Omit<ProjectMetadata, 'name' | 'rootPath'>>): ProjectRecord;
   recordError(req: RecordErrorRequest): Promise<ErrorRecord>;
   searchErrors(query: string, projectId?: string, limit?: number): Promise<ErrorSearchResult[]>;
+  mergeProjects(sourceId: string, targetId: string, dryRun?: boolean): Promise<MergeResult>;
   close(): void;
 }
 
@@ -52,6 +53,13 @@ export class SqliteGlobalStore implements GlobalStore {
 
   async searchErrors(query: string, projectId?: string, limit = 10): Promise<ErrorSearchResult[]> {
     return this.errors.search(query, projectId, limit);
+  }
+
+  // Stub: full implementation lands in a later PR (see tasks.md T-008).
+  async mergeProjects(sourceId: string, targetId: string, dryRun = true): Promise<MergeResult> {
+    throw new Error(
+      `mergeProjects not implemented in PR-1 (source=${sourceId}, target=${targetId}, dryRun=${dryRun})`,
+    );
   }
 
   close(): void {

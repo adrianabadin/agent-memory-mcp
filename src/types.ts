@@ -21,6 +21,10 @@ export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 
 export type MemoryOrigin = 'extracted' | 'inferred' | 'ambiguous' | 'manual' | 'unknown';
 
+// ── Lifecycle ────────────────────────────────────────────────────────
+
+export type MemoryStatus = 'active' | 'needs_review' | 'archived';
+
 export interface MemoryProvenance {
   origin: MemoryOrigin;
   sourceTool?: string;
@@ -37,6 +41,9 @@ export interface Memory {
   updatedAt: string;
   version: number;
   provenance?: MemoryProvenance;
+  status?: MemoryStatus;
+  reviewReason?: string;
+  reviewedAt?: string;
 }
 
 export interface ExplainPayload {
@@ -85,6 +92,225 @@ export interface PruneResult {
   candidates: { id: string; content: string; strength: number; reason: string }[];
 }
 
+// ── Session ledger ───────────────────────────────────────────────────
+
+/**
+ * Lifecycle status for a session-ledger record.
+ * Mirrors memory lifecycle semantics so decay/forget reuse the same model.
+ */
+export type SessionItemStatus = 'active' | 'forgotten';
+
+/**
+ * Discriminator for the four session-ledger entity types. Used by
+ * forget/purge results and entity-type detection.
+ */
+export type SessionItemType = 'prompt' | 'response' | 'tool_call' | 'summary';
+
+/** Shared lifecycle fields carried by every session-ledger record. */
+export interface SessionItemLifecycle {
+  updatedAt?: string;
+  accessCount?: number;
+  lastAccessedAt?: string;
+  status?: SessionItemStatus;
+}
+
+export interface SessionPrompt extends SessionItemLifecycle {
+  id: string;
+  sessionId: string;
+  rawPrompt: string;
+  createdAt: string;
+}
+
+export interface SessionResponse extends SessionItemLifecycle {
+  id: string;
+  sessionId: string;
+  promptId: string;
+  fullResponse: string;
+  createdAt: string;
+}
+
+export interface SessionToolCall extends SessionItemLifecycle {
+  id: string;
+  sessionId: string;
+  promptId?: string;
+  responseId?: string;
+  toolName: string;
+  argsSafe?: string;
+  resultSummary?: string;
+  importance?: string;
+  createdAt: string;
+}
+
+export interface SessionSummary extends SessionItemLifecycle {
+  id: string;
+  sessionId: string;
+  promptId?: string;
+  responseId?: string;
+  summary: string;
+  decisions?: string[];
+  keyTitles?: string[];
+  memoryIds?: string[];
+  artifactRefs?: string[];
+  createdAt: string;
+}
+
+/** Result of soft-forgetting a session-ledger record by id. */
+export interface SessionForgetResult {
+  type: SessionItemType;
+  success: boolean;
+}
+
+/** Result of hard-purging a session-ledger record (row + embedding) by id. */
+export interface SessionPurgeResult {
+  type: SessionItemType;
+  success: boolean;
+}
+
+export interface SessionLedger {
+  sessionId: string;
+  prompts: SessionPrompt[];
+  responses: SessionResponse[];
+  toolCalls: SessionToolCall[];
+  summaries: SessionSummary[];
+}
+
+export interface SessionMeta {
+  sessionId: string;
+  promptCount: number;
+  lastActivity: string;
+}
+
+// ── Unified search surfaces (PR 1) ───────────────────────────────────
+
+/**
+ * Source discriminator for unified search results. PR 1 implements the
+ * session-ledger subset (`session_*` + `memory`); the remaining sources
+ * (`global_error`, `promoted_pattern`, `gist`) are reserved for later PRs.
+ */
+export type UnifiedSearchSource =
+  | 'memory'
+  | 'session_prompt'
+  | 'session_response'
+  | 'session_tool_call'
+  | 'session_summary'
+  | 'global_error'
+  | 'promoted_pattern'
+  | 'gist';
+
+/** Session-ledger sources searchable in PR 1. */
+export const SESSION_SEARCH_SOURCES: readonly UnifiedSearchSource[] = [
+  'session_summary',
+  'session_prompt',
+  'session_response',
+  'session_tool_call',
+] as const;
+
+/** Compacted (summary-first) sources searched before raw session rows. */
+export const COMPACTED_SESSION_SOURCES: readonly UnifiedSearchSource[] = [
+  'session_summary',
+] as const;
+
+/** Raw session sources surfaced only when `includeRawSessionItems` is true. */
+export const RAW_SESSION_SOURCES: readonly UnifiedSearchSource[] = [
+  'session_prompt',
+  'session_response',
+  'session_tool_call',
+] as const;
+
+/**
+ * Query shape for unified search across memories, sessions, and global stores.
+ * Defaults (applied by `parseSearchQuery`): limit=10, status='active',
+ * includeContent=false, maxContentChars=4000, includeRawSessionItems=false,
+ * sourceBalancing=true.
+ */
+export interface UnifiedSearchQuery {
+  query: string;
+  sources?: UnifiedSearchSource[];
+  limit?: number;
+  status?: string;
+  projectId?: string;
+  sessionId?: string;
+  after?: string;
+  before?: string;
+  explain?: boolean;
+  includeContent?: boolean;
+  maxContentChars?: number;
+  includeRawSessionItems?: boolean;
+  sourceBalancing?: boolean;
+}
+
+/**
+ * Resolved query after defaults are applied. All optional fields of
+ * `UnifiedSearchQuery` are made concrete so downstream code never re-checks
+ * defaults.
+ */
+export interface ResolvedSearchQuery {
+  query: string;
+  sources: UnifiedSearchSource[];
+  limit: number;
+  status: string;
+  projectId?: string;
+  sessionId?: string;
+  after?: string;
+  before?: string;
+  explain: boolean;
+  includeContent: boolean;
+  maxContentChars: number;
+  includeRawSessionItems: boolean;
+  sourceBalancing: boolean;
+}
+
+/**
+ * Agent-facing hint for deciding whether to fetch full content. `summary` is a
+ * bounded snippet (≤200 chars), `relevanceScore` is normalized 0–1, and
+ * `hasTruncatedDetail` flags that more content exists behind `contentRef`.
+ */
+export interface DecisionHint {
+  summary: string;
+  relevanceScore: number;
+  hasTruncatedDetail: boolean;
+}
+
+/** Per-result scoring breakdown, present only when `explain=true`. */
+export interface UnifiedSearchExplain {
+  keywordRank: number;
+  semanticCosine: number;
+  sourceMultiplier: number;
+  decayFactor: number;
+  accessMultiplier: number;
+  finalScore: number;
+}
+
+/** Uniform result schema across all unified search surfaces. */
+export interface UnifiedSearchResult {
+  id: string;
+  source: UnifiedSearchSource;
+  content?: string;
+  contentRef: string;
+  decisionHint: DecisionHint;
+  score: number;
+  status: string;
+  createdAt: string;
+  metadata?: Record<string, unknown>;
+  explain?: UnifiedSearchExplain;
+}
+
+/** Session-specific result adding session id and compaction flag. */
+export interface SessionSearchResult extends UnifiedSearchResult {
+  sessionId: string;
+  isCompact: boolean;
+}
+
+// ── Project merging ──────────────────────────────────────────────────
+
+export interface MergeResult {
+  movedMemories: number;
+  movedErrors: number;
+  dryRun: boolean;
+  sourceProjectId: string;
+  targetProjectId: string;
+}
+
 // ── Request shapes ─────────────────────────────────────────────────
 
 export interface StoreRequest {
@@ -92,12 +318,17 @@ export interface StoreRequest {
   category: MemoryCategory;
   tags: string[];
   provenance?: MemoryProvenance;
+  id?: string;         // explicit ID for upsert
+  status?: MemoryStatus;
+  topicKey?: string;   // auto-create alias after store
 }
 
 export interface UpdateRequest {
   content?: string;
   category?: MemoryCategory;
   tags?: string[];
+  status?: MemoryStatus;
+  reviewReason?: string;
 }
 
 export interface SearchFilters {
@@ -107,6 +338,7 @@ export interface SearchFilters {
   before?: string;
   limit?: number;
   explain?: boolean;
+  status?: MemoryStatus | 'all';  // 'all' = no filter; default excludes 'archived'
 }
 
 export type SearchMode = 'hybrid' | 'keyword' | 'semantic';
@@ -131,4 +363,45 @@ export interface MemoryStore {
   delete(id: string): Promise<void>;
   stats(): Promise<MemoryStats>;
   prune(options: PruneOptions): Promise<PruneResult>;
+
+  // ── Lifecycle ──────────────────────────────────────────────────────
+  updateMemoryStatus(id: string, status: MemoryStatus, reviewReason?: string): Promise<Memory>;
+
+  // ── Topic aliases ──────────────────────────────────────────────────
+  upsertTopicAlias(topicKey: string, memoryId: string): Promise<void>;
+  resolveTopic(topicKey: string): Promise<Memory | null>;
+
+  // ── Session ledger ─────────────────────────────────────────────────
+  storeSessionPrompt(sessionId: string, rawPrompt: string): Promise<SessionPrompt>;
+  storeSessionResponse(sessionId: string, promptId: string, fullResponse: string): Promise<SessionResponse>;
+  storeSessionToolCall(params: {
+    sessionId: string;
+    promptId?: string;
+    responseId?: string;
+    toolName: string;
+    argsSafe?: string;
+    resultSummary?: string;
+    importance?: string;
+  }): Promise<SessionToolCall>;
+  storeSessionSummary(params: {
+    sessionId: string;
+    promptId?: string;
+    responseId?: string;
+    summary: string;
+    decisions?: string[];
+    keyTitles?: string[];
+    memoryIds?: string[];
+    artifactRefs?: string[];
+  }): Promise<SessionSummary>;
+  getSession(sessionId: string, opts?: { limit?: number; includeSummary?: boolean; includeForgotten?: boolean }): Promise<SessionLedger>;
+  listSessions(limit?: number): Promise<SessionMeta[]>;
+  linkPromptToMemory(promptId: string, memoryId: string, relation: string, responseId?: string): Promise<void>;
+
+  // ── Session decay & forget ─────────────────────────────────────────
+  forgetSessionItem(id: string): Promise<SessionForgetResult>;
+  purgeSessionItem(id: string): Promise<SessionPurgeResult>;
+
+  // ── Session context (in-memory state) ──────────────────────────────
+  setSessionContext(sessionId: string, projectId: string): void;
+  getSessionContext(): { sessionId: string; projectId: string } | null;
 }

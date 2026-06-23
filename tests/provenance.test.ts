@@ -72,7 +72,9 @@ describe('provenance', () => {
     const cols = migrated.prepare(`PRAGMA table_info(memories)`).all() as Array<{ name: string }>;
     expect(cols.map((c) => c.name)).toEqual(expect.arrayContaining(['origin', 'source_tool', 'session_id', 'content_hash']));
     const userVersionRow = migrated.prepare(`PRAGMA user_version`).get() as { user_version: number };
-    expect(userVersionRow.user_version).toBe(1);
+    // v0 → v1 (provenance) → v2 (lifecycle/session ledger) → v3 (session decay);
+    // migrations run automatically and bump the target version. Updated for PR-2.
+    expect(userVersionRow.user_version).toBe(3);
     const row = migrated.prepare(`SELECT id, content, origin, source_tool, session_id, content_hash FROM memories WHERE id = ?`).get('legacy-1') as Record<string, unknown>;
     expect(row.content).toBe('Legacy row');
     expect(row.origin).toBe('unknown');

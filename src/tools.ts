@@ -319,6 +319,296 @@ export function handleSearchGlobalErrors(globalStore: GlobalStore) {
   };
 }
 
+// ── Lifecycle, topic, and session tool handlers ────────────────────
+
+export function handleUpdateMemoryStatus(store: MemoryStore) {
+  return async (args: {
+    memory_id: string;
+    status: 'active' | 'needs_review' | 'archived';
+    review_reason?: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const memory = await store.updateMemoryStatus(args.memory_id, args.status, args.review_reason);
+      return success(memory);
+    } catch (err) {
+      return error(`update_memory_status failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleUpsertTopicAlias(store: MemoryStore) {
+  return async (args: {
+    topic_key: string;
+    memory_id: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      await store.upsertTopicAlias(args.topic_key, args.memory_id);
+      return success({ topic_key: args.topic_key, memory_id: args.memory_id });
+    } catch (err) {
+      return error(`upsert_topic_alias failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleResolveTopic(store: MemoryStore) {
+  return async (args: {
+    topic_key: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const memory = await store.resolveTopic(args.topic_key);
+      return success(memory);
+    } catch (err) {
+      return error(`resolve_topic failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleSetSessionContext(store: MemoryStore) {
+  return async (args: {
+    session_id: string;
+    project_id: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      store.setSessionContext(args.session_id, args.project_id);
+      return success({ sessionId: args.session_id, projectId: args.project_id });
+    } catch (err) {
+      return error(`set_session_context failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleGetSessionContext(store: MemoryStore) {
+  return async (): Promise<ReturnType<typeof success>> => {
+    try {
+      const ctx = store.getSessionContext();
+      return success(ctx);
+    } catch (err) {
+      return error(`get_session_context failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleMergeProjects(globalStore: GlobalStore) {
+  return async (args: {
+    source_project_id: string;
+    target_project_id: string;
+    dry_run?: boolean;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const dryRun = args.dry_run ?? true;
+      const result = await globalStore.mergeProjects(args.source_project_id, args.target_project_id, dryRun);
+      return success(result);
+    } catch (err) {
+      return error(`merge_projects failed: ${String(err)}`);
+    }
+  };
+}
+
+// ── Session ledger tool handlers ───────────────────────────────────
+
+export function handleStoreSessionPrompt(store: MemoryStore) {
+  return async (args: {
+    session_id: string;
+    raw_prompt: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const prompt = await store.storeSessionPrompt(args.session_id, args.raw_prompt);
+      return success(prompt);
+    } catch (err) {
+      return error(`store_session_prompt failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleStoreSessionResponse(store: MemoryStore) {
+  return async (args: {
+    session_id: string;
+    prompt_id: string;
+    full_response: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const response = await store.storeSessionResponse(args.session_id, args.prompt_id, args.full_response);
+      return success(response);
+    } catch (err) {
+      return error(`store_session_response failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleStoreSessionToolCall(store: MemoryStore) {
+  return async (args: {
+    session_id: string;
+    prompt_id?: string;
+    response_id?: string;
+    tool_name: string;
+    args_safe?: string;
+    result_summary?: string;
+    importance?: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const toolCall = await store.storeSessionToolCall({
+        sessionId: args.session_id,
+        promptId: args.prompt_id,
+        responseId: args.response_id,
+        toolName: args.tool_name,
+        argsSafe: args.args_safe,
+        resultSummary: args.result_summary,
+        importance: args.importance,
+      });
+      return success(toolCall);
+    } catch (err) {
+      return error(`store_session_tool_call failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleStoreSessionSummary(store: MemoryStore) {
+  return async (args: {
+    session_id: string;
+    prompt_id?: string;
+    response_id?: string;
+    summary: string;
+    decisions?: string[];
+    key_titles?: string[];
+    memory_ids?: string[];
+    artifact_refs?: string[];
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const summary = await store.storeSessionSummary({
+        sessionId: args.session_id,
+        promptId: args.prompt_id,
+        responseId: args.response_id,
+        summary: args.summary,
+        decisions: args.decisions,
+        keyTitles: args.key_titles,
+        memoryIds: args.memory_ids,
+        artifactRefs: args.artifact_refs,
+      });
+      return success(summary);
+    } catch (err) {
+      return error(`store_session_summary failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleGetSession(store: MemoryStore) {
+  return async (args: {
+    session_id: string;
+    limit?: number;
+    include_summary?: boolean;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const ledger = await store.getSession(args.session_id, {
+        limit: args.limit,
+        includeSummary: args.include_summary,
+      });
+      return success(ledger);
+    } catch (err) {
+      return error(`get_session failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleListSessions(store: MemoryStore) {
+  return async (args: {
+    limit?: number;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const sessions = await store.listSessions(args.limit);
+      return success({ count: sessions.length, sessions });
+    } catch (err) {
+      return error(`list_sessions failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleLinkPromptToMemory(store: MemoryStore) {
+  return async (args: {
+    prompt_id: string;
+    memory_id: string;
+    relation: 'created_from' | 'updated_by' | 'referenced';
+    response_id?: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      await store.linkPromptToMemory(args.prompt_id, args.memory_id, args.relation, args.response_id);
+      return success({ linked: true, prompt_id: args.prompt_id, memory_id: args.memory_id });
+    } catch (err) {
+      return error(`link_prompt_to_memory failed: ${String(err)}`);
+    }
+  };
+}
+
+// ── Session forget / purge (explicit soft vs hard delete) ──────────
+//
+// `forget_session_item` is a SOFT delete: it sets status='forgotten' so the
+// row is hidden from default retrieval/search but remains recoverable until
+// it is explicitly purged. `purge_session_item` is a HARD, DESTRUCTIVE
+// delete: it removes the row AND its embedding permanently. Hard purge is
+// never invoked automatically by decay/retention — only by this explicit
+// tool. Both surface store-level NOT_FOUND / AMBIGUOUS errors as safe
+// `isError` results rather than throwing out of the MCP call.
+
+export function handleForgetSessionItem(store: MemoryStore) {
+  return async (args: { id: string }): Promise<ReturnType<typeof success>> => {
+    try {
+      const result = await store.forgetSessionItem(args.id);
+      return success(result);
+    } catch (err) {
+      return error(`forget_session_item failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handlePurgeSessionItem(store: MemoryStore) {
+  return async (args: { id: string }): Promise<ReturnType<typeof success>> => {
+    try {
+      const result = await store.purgeSessionItem(args.id);
+      return success(result);
+    } catch (err) {
+      return error(`purge_session_item failed: ${String(err)}`);
+    }
+  };
+}
+
+// ── Topic key suggestion (deterministic; queued version in PR-5) ───
+
+/**
+ * Pure slugifier for topic keys: lowercase, non-alphanumeric runs → single
+ * hyphen, trimmed, capped at 60 chars. Falls back to "memory" for empty
+ * or symbol-only input.
+ */
+export function slugifyTopicKey(content: string): string {
+  const slug = content
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return slug || 'memory';
+}
+
+export function handleSuggestTopicKey(store: MemoryStore) {
+  return async (args: {
+    content: string;
+    category?: string;
+    tags?: string[];
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const base = slugifyTopicKey(args.content);
+      let candidate = base;
+      let suffix = 1;
+      // Deduplicate against existing topic keys
+      while (await store.resolveTopic(candidate)) {
+        suffix++;
+        candidate = `${base}-${suffix}`;
+      }
+      return success({ topic_key: candidate });
+    } catch (err) {
+      return error(`suggest_topic_key failed: ${String(err)}`);
+    }
+  };
+}
+
 // ── Registration ───────────────────────────────────────────────────
 
 export function registerTools(server: McpServer, store: MemoryStore, globalStore?: GlobalStore): void {
@@ -436,6 +726,177 @@ export function registerTools(server: McpServer, store: MemoryStore, globalStore
     handlePrune(store),
   );
 
+  // ── Lifecycle & topic tools ──
+
+  server.tool(
+    'update_memory_status',
+    'Transition a memory between lifecycle states: active -> needs_review -> archived.',
+    {
+      memory_id: z.string().describe('ID of the memory to transition'),
+      status: z.enum(['active', 'needs_review', 'archived']).describe('Target lifecycle status'),
+      review_reason: z.string().optional().describe('Reason for the transition (required for needs_review and archived)'),
+    },
+    handleUpdateMemoryStatus(store),
+  );
+
+  server.tool(
+    'upsert_topic_alias',
+    'Create or update a stable topic key that points to a memory.',
+    {
+      topic_key: z.string().describe('Stable key, e.g. "architecture/auth-model"'),
+      memory_id: z.string().describe('ID of the memory the key resolves to'),
+    },
+    handleUpsertTopicAlias(store),
+  );
+
+  server.tool(
+    'resolve_topic',
+    'Find a memory by its topic key. Returns null if not found.',
+    {
+      topic_key: z.string().describe('The topic key to resolve'),
+    },
+    handleResolveTopic(store),
+  );
+
+  server.tool(
+    'suggest_topic_key',
+    'Suggest a deterministic topic key derived from content, deduplicated against existing keys.',
+    {
+      content: z.string().describe('Content to derive the topic key from'),
+      category: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+    },
+    handleSuggestTopicKey(store),
+  );
+
+  // ── Session context tools ──
+
+  server.tool(
+    'set_session_context',
+    'Set the active session context. All subsequent memory stores are auto-linked to this session.',
+    {
+      session_id: z.string().describe('Active session identifier'),
+      project_id: z.string().describe('Project the session belongs to'),
+    },
+    handleSetSessionContext(store),
+  );
+
+  server.tool(
+    'get_session_context',
+    'Get the currently active session context. Returns null if no session is active.',
+    {},
+    handleGetSessionContext(store),
+  );
+
+  // ── Session ledger tools ──
+
+  server.tool(
+    'store_session_prompt',
+    'Record a user prompt in the active session ledger. Returns the prompt ID.',
+    {
+      session_id: z.string().describe('Session the prompt belongs to'),
+      raw_prompt: z.string().describe('The raw user prompt text'),
+    },
+    handleStoreSessionPrompt(store),
+  );
+
+  server.tool(
+    'store_session_response',
+    'Record an assistant response linked to a prompt. Returns the response ID.',
+    {
+      session_id: z.string().describe('Session the response belongs to'),
+      prompt_id: z.string().describe('ID of the prompt this response answers'),
+      full_response: z.string().describe('The full assistant response text'),
+    },
+    handleStoreSessionResponse(store),
+  );
+
+  server.tool(
+    'store_session_tool_call',
+    'Record an important tool call during a session.',
+    {
+      session_id: z.string().describe('Session the tool call belongs to'),
+      prompt_id: z.string().optional().describe('Prompt that triggered the call'),
+      response_id: z.string().optional().describe('Response that triggered the call'),
+      tool_name: z.string().describe('Name of the tool invoked'),
+      args_safe: z.string().optional().describe('Sanitised arguments (no secrets)'),
+      result_summary: z.string().optional().describe('Short summary of the result'),
+      importance: z.enum(['high', 'normal', 'low']).optional().describe('Importance level'),
+    },
+    handleStoreSessionToolCall(store),
+  );
+
+  server.tool(
+    'store_session_summary',
+    'Store a generated session summary. The summary content should already be generated by the PMC local model pipeline.',
+    {
+      session_id: z.string().describe('Session the summary covers'),
+      prompt_id: z.string().optional(),
+      response_id: z.string().optional(),
+      summary: z.string().describe('Generated summary text'),
+      decisions: z.array(z.string()).optional().describe('Key decisions made during the session'),
+      key_titles: z.array(z.string()).optional().describe('Titles of key artifacts'),
+      memory_ids: z.array(z.string()).optional().describe('Memory IDs created/updated during the session'),
+      artifact_refs: z.array(z.string()).optional().describe('References to artifacts (files, specs, etc.)'),
+    },
+    handleStoreSessionSummary(store),
+  );
+
+  server.tool(
+    'get_session',
+    'Retrieve the full session ledger: prompts, responses, tool calls, and optionally summaries.',
+    {
+      session_id: z.string().describe('Session to retrieve'),
+      limit: z.number().optional().describe('Max items per type'),
+      include_summary: z.boolean().optional().describe('Include summaries (default true)'),
+    },
+    handleGetSession(store),
+  );
+
+  server.tool(
+    'list_sessions',
+    'List recent sessions with prompt count and last activity time.',
+    {
+      limit: z.number().optional().describe('Max sessions to return'),
+    },
+    handleListSessions(store),
+  );
+
+  server.tool(
+    'link_prompt_to_memory',
+    'Explicitly link a session prompt/response to a memory.',
+    {
+      prompt_id: z.string().describe('Prompt to link'),
+      memory_id: z.string().describe('Memory to link to'),
+      relation: z.enum(['created_from', 'updated_by', 'referenced']).describe('Relationship type'),
+      response_id: z.string().optional().describe('Optional response ID for finer linking'),
+    },
+    handleLinkPromptToMemory(store),
+  );
+
+  // ── Session forget / purge (explicit lifecycle controls) ──
+  // forget = SOFT delete (status='forgotten', row hidden but recoverable).
+  // purge  = HARD, DESTRUCTIVE delete (row + embedding removed permanently;
+  //          never triggered automatically by decay/retention).
+
+  server.tool(
+    'forget_session_item',
+    'Soft-delete a session-ledger record (prompt, response, tool call, or summary) by id: sets status="forgotten" so it is hidden from default retrieval/search but remains recoverable until explicitly purged. Returns { type, success }. Rejects unknown or ambiguous ids.',
+    {
+      id: z.string().describe('ID of the session prompt / response / tool call / summary to soft-forget'),
+    },
+    handleForgetSessionItem(store),
+  );
+
+  server.tool(
+    'purge_session_item',
+    'PERMANENTLY and destructively delete a session-ledger record (prompt, response, tool call, or summary) by id, including its embedding. This is irreversible and never runs automatically — unlike forget, purged rows cannot be recovered. Returns { type, success }. Rejects unknown or ambiguous ids.',
+    {
+      id: z.string().describe('ID of the session prompt / response / tool call / summary to hard-purge (irreversible)'),
+    },
+    handlePurgeSessionItem(store),
+  );
+
   // ── Global context tools (registered only when globalStore is provided) ──
   if (globalStore) {
     server.tool(
@@ -490,6 +951,17 @@ export function registerTools(server: McpServer, store: MemoryStore, globalStore
         limit: z.number().optional().describe('Max results (default 10)'),
       },
       handleSearchGlobalErrors(globalStore),
+    );
+
+    server.tool(
+      'merge_projects',
+      'Consolidate duplicate project names. Moves memories/errors from source project to target project.',
+      {
+        source_project_id: z.string().describe('Project to move data FROM'),
+        target_project_id: z.string().describe('Project to move data TO'),
+        dry_run: z.boolean().optional().default(true).describe('Preview without modifying (default true)'),
+      },
+      handleMergeProjects(globalStore),
     );
   }
 }
