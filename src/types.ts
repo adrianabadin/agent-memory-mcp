@@ -44,6 +44,8 @@ export interface Memory {
   status?: MemoryStatus;
   reviewReason?: string;
   reviewedAt?: string;
+  /** v7: soft symbol link (lang|path|kind|scope|name|arity). Survives graph rebuilds. */
+  symbolKey?: string;
 }
 
 export interface ExplainPayload {
@@ -112,6 +114,10 @@ export interface SessionItemLifecycle {
   accessCount?: number;
   lastAccessedAt?: string;
   status?: SessionItemStatus;
+  /** v7: project scope for default-deny session search. Backfilled by setSessionContext. */
+  projectId?: string;
+  /** v7: soft symbol link (lang|path|kind|scope|name|arity). */
+  symbolKey?: string;
 }
 
 export interface SessionPrompt extends SessionItemLifecycle {
@@ -237,6 +243,12 @@ export interface UnifiedSearchQuery {
   maxContentChars?: number;
   includeRawSessionItems?: boolean;
   sourceBalancing?: boolean;
+  /**
+   * v7: when true, legacy session rows with a NULL project_id are included in
+   * project-scoped search results alongside the requested project's rows.
+   * Defaults to false (default-deny: null project_id rows excluded).
+   */
+  includeLegacy?: boolean;
 }
 
 /**
@@ -258,6 +270,8 @@ export interface ResolvedSearchQuery {
   maxContentChars: number;
   includeRawSessionItems: boolean;
   sourceBalancing: boolean;
+  /** v7: include legacy (null project_id) rows in project-scoped search. */
+  includeLegacy: boolean;
 }
 
 /**

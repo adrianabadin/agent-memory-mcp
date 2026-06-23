@@ -138,6 +138,7 @@ interface MemoryRow {
   activation_score?: number;
   memory_state?: string;
   last_reinforced_at?: string | null;
+  symbol_key?: string | null;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────
@@ -171,6 +172,9 @@ function rowToMemory(row: MemoryRow): Memory {
   }
   if (row.reviewed_at) {
     memory.reviewedAt = row.reviewed_at;
+  }
+  if (row.symbol_key) {
+    memory.symbolKey = row.symbol_key;
   }
   return memory;
 }
@@ -273,17 +277,11 @@ export function parseSearchQuery(query: UnifiedSearchQuery): ResolvedSearchQuery
     maxContentChars,
     includeRawSessionItems: query.includeRawSessionItems ?? false,
     sourceBalancing: query.sourceBalancing ?? true,
+    // v7: projectId now flows through to project-scoped session search
+    // (default-deny: null project_id rows excluded unless includeLegacy).
+    includeLegacy: query.includeLegacy ?? false,
   };
-  // The session ledger schema carries no per-row project association (only
-  // session_id), so projectId cannot be honored without returning cross-project
-  // rows. Reject it explicitly instead of silently ignoring the filter until the
-  // schema supports project scoping.
-  if (query.projectId) {
-    throw new Error(
-      'INVALID_ARGUMENT: projectId filtering is not supported for session search; ' +
-      'the session ledger schema has no project column. Use sessionId instead.',
-    );
-  }
+  if (query.projectId) resolved.projectId = query.projectId;
   if (query.sessionId) resolved.sessionId = query.sessionId;
   if (query.after) resolved.after = query.after;
   if (query.before) resolved.before = query.before;
@@ -399,6 +397,8 @@ interface SessionLifecycleColumns {
   access_count?: number | null;
   last_accessed_at?: string | null;
   status?: string | null;
+  project_id?: string | null;
+  symbol_key?: string | null;
 }
 
 interface SessionPromptRow extends SessionLifecycleColumns {
@@ -516,6 +516,8 @@ function applySessionLifecycle<T extends SessionItemLifecycle>(target: T, row: S
   if (row.access_count != null) target.accessCount = row.access_count;
   if (row.last_accessed_at != null) target.lastAccessedAt = row.last_accessed_at;
   if (row.status) target.status = row.status as SessionItemStatus;
+  if (row.project_id) target.projectId = row.project_id;
+  if (row.symbol_key) target.symbolKey = row.symbol_key;
 }
 
 // ── SqliteMemoryStore ─────────────────────────────────────────────
@@ -748,6 +750,36 @@ export class SqliteMemoryStore implements MemoryStore {
       this.addColumnIfMissing('memory_revive_reviews', 'gist_id', 'TEXT');
       this.addColumnIfMissing('memory_revive_reviews', 'confidence', 'REAL');
       this.db.exec('PRAGMA user_version = 6');
+    }
+
+    // ── v7: Symbol-linked memory context (soft symbol_key + project_id) ──
+    // Additive, nullable columns so existing rows are unaffected. symbol_key is
+    // a soft FK (lang|path|kind|scope|name|arity) that survives graph rebuilds.
+    // project_id scopes session-ledger rows to a project for default-deny
+    // session search. No hard FKs to graph node IDs by design (Non-Goals).
+    if (current < 7) {
+      // memories: soft symbol link only (project scope is via DB isolation).
+      this.addColumnIfMissing('memories', 'symbol_key', 'TEXT');
+      this.db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_memories_symbol_key ON memories(symbol_key)',
+      );
+
+      // All 4 session-ledger tables: project_id + symbol_key + supporting indexes.
+      const sessionTables = [
+        'session_prompts', 'session_responses', 'session_tool_calls', 'session_summaries',
+      ];
+      for (const tbl of sessionTables) {
+        this.addColumnIfMissing(tbl, 'project_id', 'TEXT');
+        this.addColumnIfMissing(tbl, 'symbol_key', 'TEXT');
+        this.db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_${tbl}_project_id ON ${tbl}(project_id)`,
+        );
+        this.db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_${tbl}_symbol_key ON ${tbl}(symbol_key)`,
+        );
+      }
+
+      this.db.exec('PRAGMA user_version = 7');
     }
   }
 
@@ -1628,6 +1660,19 @@ export class SqliteMemoryStore implements MemoryStore {
       where.push('session_id = ?');
       args.push(q.sessionId);
     }
+    // v7: project-scoped session search (default-deny).
+    // When projectId is set, exclude rows from OTHER projects always.
+    // Legacy rows (NULL project_id) are excluded by default and only
+    // included when includeLegacy is explicitly true.
+    if (q.projectId) {
+      if (q.includeLegacy) {
+        where.push('(project_id = ? OR project_id IS NULL)');
+        args.push(q.projectId);
+      } else {
+        where.push('project_id = ?');
+        args.push(q.projectId);
+      }
+    }
     if (q.after) {
       where.push('created_at >= ?');
       args.push(q.after);
@@ -2086,6 +2131,23 @@ export class SqliteMemoryStore implements MemoryStore {
 
   setSessionContext(sessionId: string, projectId: string): void {
     this.sessionContext = { sessionId, projectId };
+    // v7: backfill project_id on existing ledger rows for this session that
+    // still carry a NULL project_id (legacy rows created before the v7
+    // migration or before a session context was established). Only touches
+    // NULL rows so an explicit re-scope call never clobbers an existing value.
+    // Synchronous and best-effort: a few rows per session, no fire-and-forget.
+    const sessionTables = [
+      'session_prompts', 'session_responses', 'session_tool_calls', 'session_summaries',
+    ];
+    try {
+      for (const tbl of sessionTables) {
+        this.db.prepare(
+          `UPDATE ${tbl} SET project_id = ? WHERE session_id = ? AND project_id IS NULL`,
+        ).run(projectId, sessionId);
+      }
+    } catch {
+      // Backfill must never fail the session-context call.
+    }
   }
 
   getSessionContext(): { sessionId: string; projectId: string } | null {
@@ -2298,17 +2360,17 @@ export class SqliteMemoryStore implements MemoryStore {
       : `AND (status IS NULL OR status != 'forgotten')`;
 
     const promptRows = this.db.prepare(
-      `SELECT id, session_id, raw_prompt, created_at, updated_at, access_count, last_accessed_at, status FROM session_prompts
+      `SELECT id, session_id, raw_prompt, created_at, updated_at, access_count, last_accessed_at, status, project_id, symbol_key FROM session_prompts
        WHERE session_id = ? ${statusFilter} ORDER BY created_at ASC${limitClause}`,
     ).all(sessionId, ...limitArgs) as unknown as SessionPromptRow[];
 
     const responseRows = this.db.prepare(
-      `SELECT id, session_id, prompt_id, full_response, created_at, updated_at, access_count, last_accessed_at, status FROM session_responses
+      `SELECT id, session_id, prompt_id, full_response, created_at, updated_at, access_count, last_accessed_at, status, project_id, symbol_key FROM session_responses
        WHERE session_id = ? ${statusFilter} ORDER BY created_at ASC${limitClause}`,
     ).all(sessionId, ...limitArgs) as unknown as SessionResponseRow[];
 
     const toolCallRows = this.db.prepare(
-      `SELECT id, session_id, prompt_id, response_id, tool_name, args_safe, result_summary, importance, created_at, updated_at, access_count, last_accessed_at, status
+      `SELECT id, session_id, prompt_id, response_id, tool_name, args_safe, result_summary, importance, created_at, updated_at, access_count, last_accessed_at, status, project_id, symbol_key
        FROM session_tool_calls WHERE session_id = ? ${statusFilter} ORDER BY created_at ASC${limitClause}`,
     ).all(sessionId, ...limitArgs) as unknown as SessionToolCallRow[];
 
@@ -2316,7 +2378,7 @@ export class SqliteMemoryStore implements MemoryStore {
     const summaryRows: SessionSummaryRow[] = opts?.includeSummary === false
       ? []
       : this.db.prepare(
-          `SELECT id, session_id, prompt_id, response_id, summary, decisions, key_titles, memory_ids, artifact_refs, created_at, updated_at, access_count, last_accessed_at, status
+          `SELECT id, session_id, prompt_id, response_id, summary, decisions, key_titles, memory_ids, artifact_refs, created_at, updated_at, access_count, last_accessed_at, status, project_id, symbol_key
            FROM session_summaries WHERE session_id = ? ${statusFilter} ORDER BY created_at ASC${limitClause}`,
         ).all(sessionId, ...limitArgs) as unknown as SessionSummaryRow[];
 

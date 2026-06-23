@@ -115,12 +115,12 @@ describe('parseSearchQuery: defaults & validation', () => {
     expect(resolved.sources.length).toBeGreaterThan(0);
   });
 
-  // projectId is part of the unified query contract, but the session ledger
-  // schema carries no per-row project association (only session_id). Silently
-  // ignoring projectId would return cross-project rows under a project filter,
-  // so the parser MUST reject it until the schema supports project scoping.
-  it('rejects projectId for session search (no schema support yet)', () => {
-    expect(() => parseSearchQuery({ query: 'alpha', projectId: 'proj-1' })).toThrow(/projectId/i);
+  // projectId is now supported for session search via the v7 project_id column.
+  // The parser MUST accept it and flow it through to the resolved query rather
+  // than rejecting it.
+  it('accepts projectId and flows it through to the resolved query', () => {
+    const resolved = parseSearchQuery({ query: 'alpha', projectId: 'proj-1' });
+    expect(resolved.projectId).toBe('proj-1');
   });
 
   it('still accepts queries without projectId', () => {

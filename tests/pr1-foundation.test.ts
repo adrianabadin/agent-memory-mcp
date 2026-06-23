@@ -49,9 +49,9 @@ describe('T-001: migration v2 and status schema', () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it('bumps user_version to 4 after initialize', () => {
+  it('bumps user_version to 7 after initialize', () => {
     const db = new DatabaseSync(dbPath);
-    expect(userVersion(db)).toBe(6);
+    expect(userVersion(db)).toBe(7);
     db.close();
   });
 
@@ -107,10 +107,10 @@ describe('T-001: migration v2 and status schema', () => {
     });
   }
 
-  it('re-initialization is idempotent (user_version stays 6, no error)', async () => {
+  it('re-initialization is idempotent (user_version stays 7, no error)', async () => {
     await expect(store.initialize()).resolves.toBeUndefined();
     const db = new DatabaseSync(dbPath);
-    expect(userVersion(db)).toBe(6);
+    expect(userVersion(db)).toBe(7);
     db.close();
   });
 
@@ -162,14 +162,14 @@ describe('T-001: migration v2 and status schema', () => {
     `);
     v1db.close();
 
-    // Initialize against the v1 db — should migrate all the way to v4.
+    // Initialize against the v1 db — should migrate all the way to v7.
     const s = new SqliteMemoryStore(v1Path, new MockEmbedder());
     await s.initialize();
     s.close();
 
     // Inspect after the store handle is released (Windows-friendly).
     const check = new DatabaseSync(v1Path);
-    expect(userVersion(check)).toBe(6);
+    expect(userVersion(check)).toBe(7);
     const cols = tableColumns(check, 'memories');
     expect(cols).toEqual(expect.arrayContaining(['status', 'review_reason', 'reviewed_at']));
     expect(tableColumns(check, 'session_prompts').length).toBeGreaterThan(0);
