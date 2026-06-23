@@ -462,15 +462,16 @@ describe('sleep-run pipeline: full orchestration', () => {
       );
 
       expect(report.status).toBe('completed');
-      expect(report.phases).toHaveLength(6);
+      expect(report.phases).toHaveLength(7);
       expect(report.phases[0].name).toBe('lease_acquire');
       expect(report.phases[0].status).toBe('completed');
       expect(report.phases[1].name).toBe('refresh_context');
       expect(report.phases[2].name).toBe('decay_evaluation');
-      expect(report.phases[3].name).toBe('promotion_pass');
-      expect(report.phases[4].name).toBe('sync_context');
-      expect(report.phases[5].name).toBe('lease_release');
-      expect(report.phases[5].status).toBe('completed');
+      expect(report.phases[3].name).toBe('enrich');
+      expect(report.phases[4].name).toBe('promotion_pass');
+      expect(report.phases[5].name).toBe('sync_context');
+      expect(report.phases[6].name).toBe('lease_release');
+      expect(report.phases[6].status).toBe('completed');
 
       // All phases should have timestamps
       for (const phase of report.phases) {
@@ -688,6 +689,312 @@ describe('sleep-run pipeline: report structure', () => {
 
       expect(report.summary.decayEvaluated).toBe(2);
       expect(report.summary.decayTransitioned).toBe(1);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Sleep-Run Pipeline: Enrich Phase (Local-Only Enforcement)
+// ═════════════════════════════════════════════════════════════════════
+
+describe('sleep-run pipeline: enrich phase', () => {
+  let env: Awaited<ReturnType<typeof makeTestEnv>>;
+
+  beforeEach(async () => { env = await makeTestEnv(); });
+  afterEach(async () => { await env.cleanup(); });
+
+  it('runs enrich phase with local-model provider', async () => {
+    // Add memories so enrich phase has symbols to process
+    await env.store.store({ content: 'enrich test 1', category: 'learning', tags: [] });
+    await env.store.store({ content: 'enrich test 2', category: 'learning', tags: [] });
+
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-enrich-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+    let enrichCalled = false;
+
+    try {
+      const report = await executeSleepRun(
+        {
+          store: env.store,
+          db: env.db,
+          enrichmentProvider: async (symbols, provider) => {
+            enrichCalled = true;
+            expect(provider).toBe('local-model');
+            return { enriched: symbols.length, deferred: 0, provider: 'local-model' };
+          },
+        },
+        { checkpointPath, enrichmentProvider: 'local-model' },
+      );
+
+      expect(report.status).toBe('completed');
+      expect(enrichCalled).toBe(true);
+      const enrichPhase = report.phases.find(p => p.name === 'enrich');
+      expect(enrichPhase?.status).toBe('completed');
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('defers enrichment when provider is not local-model', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-enrich-defer-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+
+    try {
+      const report = await executeSleepRun(
+        {
+          store: env.store,
+          db: env.db,
+          enrichmentProvider: async () => ({ enriched: 0, deferred: 0, provider: 'local-model' }),
+        },
+        { checkpointPath, enrichmentProvider: 'remote-model' as any },
+      );
+
+      expect(report.status).toBe('completed');
+      expect(report.summary.symbolsDeferred).toBeGreaterThanOrEqual(1);
+      const enrichPhase = report.phases.find(p => p.name === 'enrich');
+      expect(enrichPhase?.result).toMatchObject({ local_model_unavailable: true });
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('defers enrichment when no provider configured', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-enrich-none-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+
+    try {
+      const report = await executeSleepRun(
+        { store: env.store, db: env.db },
+        { checkpointPath },
+      );
+
+      expect(report.status).toBe('completed');
+      expect(report.summary.symbolsDeferred).toBeGreaterThanOrEqual(1);
+      const enrichPhase = report.phases.find(p => p.name === 'enrich');
+      expect(enrichPhase?.result).toMatchObject({ local_model_unavailable: true });
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('includes enrich phase in the pipeline phases list', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-enrich-phase-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+
+    try {
+      const report = await executeSleepRun(
+        { store: env.store, db: env.db },
+        { checkpointPath },
+      );
+
+      const phaseNames = report.phases.map(p => p.name);
+      expect(phaseNames).toContain('enrich');
+      // Enrich should come after decay_evaluation
+      const decayIdx = phaseNames.indexOf('decay_evaluation');
+      const enrichIdx = phaseNames.indexOf('enrich');
+      expect(enrichIdx).toBeGreaterThan(decayIdx);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Sleep-Run Pipeline: Symbol-Boundary Pause/Yield
+// ═════════════════════════════════════════════════════════════════════
+
+describe('sleep-run pipeline: symbol-boundary pause/yield', () => {
+  let env: Awaited<ReturnType<typeof makeTestEnv>>;
+
+  beforeEach(async () => { env = await makeTestEnv(); });
+  afterEach(async () => { await env.cleanup(); });
+
+  it('pauses when shouldPause returns true during enrich', async () => {
+    // Create some memories to enrich
+    await env.store.store({ content: 'memory 1', category: 'learning', tags: [] });
+    await env.store.store({ content: 'memory 2', category: 'learning', tags: [] });
+    await env.store.store({ content: 'memory 3', category: 'learning', tags: [] });
+
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-pause-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+    let symbolCount = 0;
+
+    try {
+      const report = await executeSleepRun(
+        {
+          store: env.store,
+          db: env.db,
+          enrichmentProvider: async (symbols) => {
+            symbolCount += symbols.length;
+            return { enriched: symbols.length, deferred: 0, provider: 'local-model' };
+          },
+          shouldPause: () => symbolCount >= 2, // Pause after 2 symbols
+        },
+        { checkpointPath, enrichmentProvider: 'local-model' },
+      );
+
+      expect(report.status).toBe('paused');
+      expect(report.summary.pausedByActivity).toBe(true);
+      // Should have processed at most 2 symbols before pausing
+      expect(report.summary.symbolsEnriched).toBeLessThanOrEqual(2);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('flushes checkpoint when pausing', async () => {
+    await env.store.store({ content: 'checkpoint test', category: 'learning', tags: [] });
+
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-pause-checkpoint-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+
+    try {
+      await executeSleepRun(
+        {
+          store: env.store,
+          db: env.db,
+          enrichmentProvider: async (symbols) => ({ enriched: symbols.length, deferred: 0, provider: 'local-model' }),
+          shouldPause: () => true, // Always pause
+        },
+        { checkpointPath, enrichmentProvider: 'local-model' },
+      );
+
+      // Checkpoint should exist
+      const loaded = await loadCheckpoint(checkpointPath);
+      expect(loaded).not.toBeNull();
+      expect(loaded!.status).toBe('paused');
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('completes normally when shouldPause never triggers', async () => {
+    await env.store.store({ content: 'no pause', category: 'learning', tags: [] });
+
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-no-pause-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+
+    try {
+      const report = await executeSleepRun(
+        {
+          store: env.store,
+          db: env.db,
+          enrichmentProvider: async (symbols) => ({ enriched: symbols.length, deferred: 0, provider: 'local-model' }),
+          shouldPause: () => false,
+        },
+        { checkpointPath, enrichmentProvider: 'local-model' },
+      );
+
+      expect(report.status).toBe('completed');
+      expect(report.summary.pausedByActivity).toBe(false);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Sleep-Run Pipeline: Multi-Project Iteration
+// ═════════════════════════════════════════════════════════════════════
+
+describe('sleep-run pipeline: multi-project iteration', () => {
+  let env: Awaited<ReturnType<typeof makeTestEnv>>;
+
+  beforeEach(async () => { env = await makeTestEnv(); });
+  afterEach(async () => { await env.cleanup(); });
+
+  it('iterates over multiple projects for refresh/sync', async () => {
+    let refreshCount = 0;
+    let syncCount = 0;
+
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-multi-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+
+    try {
+      const report = await executeSleepRun(
+        {
+          store: env.store,
+          db: env.db,
+          refreshContext: async () => { refreshCount++; },
+          syncContext: async () => { syncCount++; },
+        },
+        { checkpointPath, projectIds: ['proj-a', 'proj-b', 'proj-c'] },
+      );
+
+      expect(report.status).toBe('completed');
+      expect(refreshCount).toBe(3);
+      expect(syncCount).toBe(3);
+      expect(report.summary.projectsProcessed).toBe(3);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports project IDs in the report', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-multi-report-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+
+    try {
+      const report = await executeSleepRun(
+        { store: env.store, db: env.db },
+        { checkpointPath, projectIds: ['proj-x', 'proj-y'] },
+      );
+
+      expect(report.projects).toEqual(['proj-x', 'proj-y']);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to single-project when projectIds is empty', async () => {
+    let refreshCount = 0;
+
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-single-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+
+    try {
+      const report = await executeSleepRun(
+        {
+          store: env.store,
+          db: env.db,
+          refreshContext: async () => { refreshCount++; },
+        },
+        { checkpointPath },
+      );
+
+      expect(report.status).toBe('completed');
+      expect(refreshCount).toBe(1);
+      expect(report.summary.projectsProcessed).toBe(0);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('continues when individual project refresh fails', async () => {
+    let callCount = 0;
+
+    const tmpDir = await mkdtemp(join(tmpdir(), 'sleep-multi-fail-'));
+    const checkpointPath = join(tmpDir, 'report.json');
+
+    try {
+      const report = await executeSleepRun(
+        {
+          store: env.store,
+          db: env.db,
+          refreshContext: async () => {
+            callCount++;
+            if (callCount === 2) throw new Error('project-b refresh failed');
+          },
+        },
+        { checkpointPath, projectIds: ['proj-a', 'proj-b', 'proj-c'] },
+      );
+
+      // Pipeline should still complete (refresh failure is non-fatal)
+      expect(report.status).toBe('completed');
+      const refreshPhase = report.phases.find(p => p.name === 'refresh_context');
+      expect(refreshPhase?.status).toBe('failed');
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }

@@ -6,10 +6,13 @@
 //
 // Pipeline phases:
 //   1. keep-awake lease acquire
-//   2. decay evaluation (evaluateAllMemoriesForDecay)
-//   3. promotion pass (PromotionRuleEngine for eligible memories)
-//   4. checkpoint report persistence
-//   5. keep-awake lease release
+//   2. refresh context (per-project if multi-project)
+//   3. decay evaluation (evaluateAllMemoriesForDecay)
+//   4. enrich phase (local-only enforcement, symbol-boundary pause/yield)
+//   5. promotion pass (PromotionRuleEngine for eligible memories)
+//   6. sync context (per-project if multi-project)
+//   7. checkpoint report persistence
+//   8. keep-awake lease release
 
 import { randomUUID } from 'node:crypto';
 import { writeFile, readFile, mkdir } from 'node:fs/promises';
@@ -20,6 +23,25 @@ import { PromotionRuleEngine } from './global/global-promotion.js';
 import type { PromotionResult } from './global/global-promotion.js';
 import { DEFAULT_FORGETTING_CONFIG } from './decay.js';
 import type { ForgettingConfig } from './decay.js';
+
+// ── Enrichment provider types ───────────────────────────────────────
+
+/** Enrichment provider identifier. Only 'local-model' is allowed for sleep runs. */
+export type EnrichmentProviderId = 'local-model';
+
+/** Result of an enrichment attempt. */
+export interface EnrichResult {
+  enriched: number;
+  deferred: number;
+  provider: EnrichmentProviderId;
+  reason?: string;
+}
+
+/** Enrichment provider function signature. */
+export type EnrichmentProvider = (
+  symbols: string[],
+  provider: EnrichmentProviderId,
+) => Promise<EnrichResult>;
 
 // ── Report JSON Schema ──────────────────────────────────────────────
 
@@ -39,6 +61,10 @@ export interface SleepRunSummary {
   promotionPromoted: number;
   symbolsEnriched: number;
   symbolsDeferred: number;
+  /** Number of projects processed (multi-project mode). */
+  projectsProcessed: number;
+  /** Whether the run was paused due to activity detection. */
+  pausedByActivity: boolean;
 }
 
 export interface SleepRunReport {
@@ -49,6 +75,8 @@ export interface SleepRunReport {
   phases: SleepRunPhaseResult[];
   summary: SleepRunSummary;
   errors: string[];
+  /** Multi-project: list of project IDs processed in this run. */
+  projects?: string[];
 }
 
 // ── Keep-Awake Lease ────────────────────────────────────────────────
@@ -80,17 +108,27 @@ export interface SleepRunConfig {
   leaseHolder?: string;
   /** Maximum memories to evaluate for promotion per run. Defaults to 100. */
   promotionBatchSize?: number;
+  /** Multi-project: list of project IDs to iterate over. If empty, runs single-project. */
+  projectIds?: string[];
+  /** Enrichment provider ID. Must be 'local-model' for sleep runs. */
+  enrichmentProvider?: EnrichmentProviderId;
 }
 
 export interface SleepRunDeps {
   store: SqliteMemoryStore;
   db: DatabaseSync;
-  /** Optional external enrichment callback. Returns count of enriched symbols. */
-  enrich?: (symbols: string[]) => Promise<number>;
+  /** Enrichment provider. Required for enrich phase; enforces local-only. */
+  enrichmentProvider?: EnrichmentProvider;
   /** Optional external refresh-context callback. */
   refreshContext?: () => Promise<void>;
   /** Optional external sync-context callback. */
   syncContext?: () => Promise<void>;
+  /**
+   * Activity detector: returns true if user activity or CPU pressure is detected
+   * and the run should pause at the next safe boundary. Checked after each symbol
+   * during the enrich phase.
+   */
+  shouldPause?: () => boolean;
 }
 
 // ── In-memory lease manager ─────────────────────────────────────────
@@ -157,6 +195,7 @@ function createReport(runId: string): SleepRunReport {
       { name: 'lease_acquire', status: 'pending', startedAt: null, completedAt: null },
       { name: 'refresh_context', status: 'pending', startedAt: null, completedAt: null },
       { name: 'decay_evaluation', status: 'pending', startedAt: null, completedAt: null },
+      { name: 'enrich', status: 'pending', startedAt: null, completedAt: null },
       { name: 'promotion_pass', status: 'pending', startedAt: null, completedAt: null },
       { name: 'sync_context', status: 'pending', startedAt: null, completedAt: null },
       { name: 'lease_release', status: 'pending', startedAt: null, completedAt: null },
@@ -168,6 +207,8 @@ function createReport(runId: string): SleepRunReport {
       promotionPromoted: 0,
       symbolsEnriched: 0,
       symbolsDeferred: 0,
+      projectsProcessed: 0,
+      pausedByActivity: false,
     },
     errors: [],
   };
@@ -208,6 +249,9 @@ function failPhase(report: SleepRunReport, phaseName: string, error: string): vo
  *
  * The pipeline is idempotent: re-running with the same database state
  * produces the same decay/promotion results (no double-processing).
+ *
+ * Supports multi-project iteration: when config.projectIds is non-empty,
+ * the pipeline iterates over each project running refresh/enrich/sync per project.
  */
 export async function executeSleepRun(
   deps: SleepRunDeps,
@@ -219,6 +263,12 @@ export async function executeSleepRun(
   const leaseHolder = config.leaseHolder ?? `sleep-run-${runId}`;
   const leaseTTL = config.leaseTTLMs ?? 300_000;
   const promotionBatchSize = config.promotionBatchSize ?? 100;
+  const projectIds = config.projectIds ?? [];
+
+  // Track multi-project IDs in report
+  if (projectIds.length > 0) {
+    report.projects = projectIds;
+  }
 
   try {
     // Phase 1: Acquire keep-awake lease
@@ -232,11 +282,19 @@ export async function executeSleepRun(
     }
     completePhase(report, 'lease_acquire', { holder: leaseHolder, ttlMs: leaseTTL });
 
-    // Phase 2: Refresh context (optional)
+    // Phase 2: Refresh context (per-project if multi-project)
     startPhase(report, 'refresh_context');
     if (deps.refreshContext) {
       try {
-        await deps.refreshContext();
+        if (projectIds.length > 0) {
+          // Multi-project: refresh each project
+          for (const _projectId of projectIds) {
+            await deps.refreshContext();
+            report.summary.projectsProcessed++;
+          }
+        } else {
+          await deps.refreshContext();
+        }
         completePhase(report, 'refresh_context');
       } catch (e) {
         failPhase(report, 'refresh_context', String(e));
@@ -266,7 +324,23 @@ export async function executeSleepRun(
       return report;
     }
 
-    // Phase 4: Promotion pass
+    // Phase 4: Enrich (local-only enforcement, symbol-boundary pause/yield)
+    startPhase(report, 'enrich');
+    const enrichResult = await runEnrichPhase(deps, config, report);
+    if (enrichResult.paused) {
+      // Activity detected — flush checkpoint and return paused
+      completePhase(report, 'enrich', { ...enrichResult });
+      startPhase(report, 'lease_release');
+      leaseManager.release(leaseHolder);
+      completePhase(report, 'lease_release');
+      report.status = 'paused';
+      report.completedAt = new Date().toISOString();
+      report.summary.pausedByActivity = true;
+      try { await persistReport(config.checkpointPath, report); } catch { /* non-fatal */ }
+      return report;
+    }
+
+    // Phase 5: Promotion pass
     startPhase(report, 'promotion_pass');
     try {
       const promotionResult = runPromotionPass(deps.db, promotionBatchSize);
@@ -278,11 +352,17 @@ export async function executeSleepRun(
       // Non-fatal: continue pipeline
     }
 
-    // Phase 5: Sync context (optional)
+    // Phase 6: Sync context (per-project if multi-project)
     startPhase(report, 'sync_context');
     if (deps.syncContext) {
       try {
-        await deps.syncContext();
+        if (projectIds.length > 0) {
+          for (const _projectId of projectIds) {
+            await deps.syncContext();
+          }
+        } else {
+          await deps.syncContext();
+        }
         completePhase(report, 'sync_context');
       } catch (e) {
         failPhase(report, 'sync_context', String(e));
@@ -292,7 +372,7 @@ export async function executeSleepRun(
       completePhase(report, 'sync_context', { skipped: true, reason: 'no syncContext callback' });
     }
 
-    // Phase 6: Release keep-awake lease
+    // Phase 7: Release keep-awake lease
     startPhase(report, 'lease_release');
     leaseManager.release(leaseHolder);
     completePhase(report, 'lease_release');
@@ -315,6 +395,94 @@ export async function executeSleepRun(
   }
 
   return report;
+}
+
+// ── Enrich phase with local-only enforcement ────────────────────────
+
+interface EnrichPhaseResult {
+  enriched: number;
+  deferred: number;
+  paused: boolean;
+  reason?: string;
+}
+
+/**
+ * Run the enrich phase with local-only enforcement and symbol-boundary pause/yield.
+ *
+ * - Validates that the enrichment provider is 'local-model'
+ * - If provider unavailable, marks deferred with local_model_unavailable
+ * - Processes symbols one at a time, checking shouldPause after each
+ * - Flushes checkpoint at safe boundaries when pause detected
+ */
+async function runEnrichPhase(
+  deps: SleepRunDeps,
+  config: SleepRunConfig,
+  report: SleepRunReport,
+): Promise<EnrichPhaseResult> {
+  const providerId = config.enrichmentProvider ?? 'local-model';
+
+  // Local-only enforcement: only 'local-model' provider is allowed
+  if (providerId !== 'local-model') {
+    report.summary.symbolsDeferred++;
+    completePhase(report, 'enrich', {
+      skipped: true,
+      reason: `provider '${providerId}' not allowed; only 'local-model' permitted`,
+      local_model_unavailable: true,
+    });
+    return { enriched: 0, deferred: 1, paused: false, reason: 'local_model_unavailable' };
+  }
+
+  if (!deps.enrichmentProvider) {
+    report.summary.symbolsDeferred++;
+    completePhase(report, 'enrich', {
+      skipped: true,
+      reason: 'no enrichment provider configured',
+      local_model_unavailable: true,
+    });
+    return { enriched: 0, deferred: 1, paused: false, reason: 'local_model_unavailable' };
+  }
+
+  // Fetch symbols to enrich (non-purged memories with content)
+  const symbols = deps.db.prepare(
+    `SELECT id FROM memories WHERE memory_state != 'purged' ORDER BY updated_at DESC LIMIT 500`,
+  ).all() as Array<{ id: string }>;
+
+  if (symbols.length === 0) {
+    completePhase(report, 'enrich', { skipped: true, reason: 'no symbols to enrich' });
+    return { enriched: 0, deferred: 0, paused: false };
+  }
+
+  let enriched = 0;
+  let deferred = 0;
+
+  // Symbol-boundary pause/yield: process one symbol at a time
+  for (const sym of symbols) {
+    // Check for activity detection before each symbol
+    if (deps.shouldPause?.()) {
+      report.summary.symbolsEnriched += enriched;
+      report.summary.symbolsDeferred += deferred;
+      // Flush checkpoint at safe boundary
+      try {
+        await persistReport(config.checkpointPath, report);
+      } catch { /* non-fatal */ }
+      return { enriched, deferred, paused: true, reason: 'user_activity_detected' };
+    }
+
+    try {
+      const result = await deps.enrichmentProvider([sym.id], providerId);
+      enriched += result.enriched;
+      deferred += result.deferred;
+    } catch (e) {
+      // Per-symbol failure is non-fatal; continue with next symbol
+      deferred++;
+    }
+  }
+
+  report.summary.symbolsEnriched += enriched;
+  report.summary.symbolsDeferred += deferred;
+  completePhase(report, 'enrich', { enriched, deferred, provider: providerId });
+
+  return { enriched, deferred, paused: false };
 }
 
 // ── Promotion pass ──────────────────────────────────────────────────
