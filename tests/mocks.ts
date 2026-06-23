@@ -20,6 +20,7 @@ import type {
   SessionSummary,
   SessionToolCall,
   StoreRequest,
+  SymbolLinkedResult,
   UpdateRequest,
 } from '../src/types.js';
 
@@ -568,6 +569,98 @@ export class MockMemoryStore implements MemoryStore {
 
   getSessionContext(): { sessionId: string; projectId: string } | null {
     return this.sessionCtx;
+  }
+
+  // ── Symbol-linked memory context (v7) ─────────────────────────
+
+  async attachSymbol(opts: { symbolKey: string; memoryId?: string; sessionItemId?: string }): Promise<{ id: string; symbolKey: string }> {
+    const { symbolKey, memoryId, sessionItemId } = opts;
+    if (memoryId) {
+      const mem = this.memoriesById.get(memoryId);
+      if (!mem) throw new Error(`Memory ${memoryId} not found`);
+      // Update the object in-place (same reference as in the Map).
+      (mem as any).symbolKey = symbolKey;
+      return { id: memoryId, symbolKey };
+    }
+    if (sessionItemId) {
+      // Search all session stores for the id.
+      for (const [id, item] of this.summariesById) {
+        if (id === sessionItemId) {
+          (item as any).symbolKey = symbolKey;
+          return { id: sessionItemId, symbolKey };
+        }
+      }
+      for (const [id, item] of this.promptsById) {
+        if (id === sessionItemId) {
+          (item as any).symbolKey = symbolKey;
+          return { id: sessionItemId, symbolKey };
+        }
+      }
+      for (const [id, item] of this.responsesById) {
+        if (id === sessionItemId) {
+          (item as any).symbolKey = symbolKey;
+          return { id: sessionItemId, symbolKey };
+        }
+      }
+      for (const [id, item] of this.toolCallsById) {
+        if (id === sessionItemId) {
+          (item as any).symbolKey = symbolKey;
+          return { id: sessionItemId, symbolKey };
+        }
+      }
+      throw new Error(`Session item ${sessionItemId} not found`);
+    }
+    throw new Error('Either memory_id or session_item_id must be provided');
+  }
+
+  async getBySymbol(symbolKey: string, opts?: { sources?: string[]; limit?: number }): Promise<SymbolLinkedResult[]> {
+    const sources = opts?.sources ?? ['memory', 'session_summary'];
+    const limit = opts?.limit ?? 50;
+    const results: SymbolLinkedResult[] = [];
+
+    if (sources.includes('memory')) {
+      for (const mem of this.memories) {
+        if ((mem as any).symbolKey === symbolKey) {
+          results.push({
+            id: mem.id,
+            source: 'memory',
+            symbolKey,
+            content: mem.content,
+            createdAt: mem.createdAt,
+          });
+        }
+      }
+    }
+
+    const sessionSources: Array<[string, Map<string, { sessionId: string; createdAt: string; symbolKey?: string; [k: string]: any }>, string]> = [];
+    if (sources.includes('session_summary')) {
+      sessionSources.push(['session_summary', this.summariesById as any, 'summary']);
+    }
+    if (sources.includes('session_prompt')) {
+      sessionSources.push(['session_prompt', this.promptsById as any, 'rawPrompt']);
+    }
+    if (sources.includes('session_response')) {
+      sessionSources.push(['session_response', this.responsesById as any, 'fullResponse']);
+    }
+    if (sources.includes('session_tool_call')) {
+      sessionSources.push(['session_tool_call', this.toolCallsById as any, 'resultSummary']);
+    }
+
+    for (const [source, store, contentField] of sessionSources) {
+      for (const [, item] of store) {
+        if ((item as any).symbolKey === symbolKey) {
+          results.push({
+            id: item.id,
+            source: source as SymbolLinkedResult['source'],
+            symbolKey,
+            content: (item as any)[contentField] ?? '',
+            createdAt: item.createdAt,
+          });
+        }
+      }
+    }
+
+    return results.slice(0, limit);
   }
 
   // ── Helpers ────────────────────────────────────────────────────

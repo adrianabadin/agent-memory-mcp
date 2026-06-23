@@ -418,4 +418,31 @@ export interface MemoryStore {
   // ── Session context (in-memory state) ──────────────────────────────
   setSessionContext(sessionId: string, projectId: string): void;
   getSessionContext(): { sessionId: string; projectId: string } | null;
+
+  // ── Symbol-linked memory context (v7) ─────────────────────────────
+  /** Attach a symbol key to an existing memory or session item. Upserts. */
+  attachSymbol(opts: { symbolKey: string; memoryId?: string; sessionItemId?: string }): Promise<{ id: string; symbolKey: string }>;
+  /** Return all memories and session items linked to a symbol key. */
+  getBySymbol(symbolKey: string, opts?: { sources?: string[]; limit?: number }): Promise<SymbolLinkedResult[]>;
+}
+
+/** Result of looking up records by symbol key. */
+export interface SymbolLinkedResult {
+  id: string;
+  source: 'memory' | 'session_prompt' | 'session_response' | 'session_tool_call' | 'session_summary';
+  symbolKey: string;
+  content: string;
+  createdAt: string;
+}
+
+/** Per-symbol enrichment result (raw-canonical + optional structured fields). */
+export interface EnrichSymbolResult {
+  symbolKey: string;
+  found: boolean;
+  raw?: string;
+  structured?: {
+    purpose?: string;
+    inputs?: string;
+    outputs?: string;
+  };
 }

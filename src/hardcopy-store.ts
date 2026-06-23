@@ -172,6 +172,16 @@ export class HardcopyMemoryStore implements MemoryStore {
     return this.inner.getSessionContext();
   }
 
+  // ── Symbol-linked memory context (v7) — pass through ─────────
+
+  async attachSymbol(opts: { symbolKey: string; memoryId?: string; sessionItemId?: string }): Promise<{ id: string; symbolKey: string }> {
+    return this.inner.attachSymbol(opts);
+  }
+
+  async getBySymbol(symbolKey: string, opts?: { sources?: string[]; limit?: number }): Promise<import('./types.js').SymbolLinkedResult[]> {
+    return this.inner.getBySymbol(symbolKey, opts);
+  }
+
   // ── Private ─────────────────────────────────────────────────
 
   private safeIdPath(id: string): string | null {

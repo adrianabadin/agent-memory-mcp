@@ -386,3 +386,160 @@ describe('row converters: symbol_key and project_id mapping', () => {
     expect(ledger.summaries[0].symbolKey).toBe('ts|src/bar.ts|class|module|Baz|0');
   });
 });
+
+// ── T-v7: attachSymbol (PR #2) ─────────────────────────────────────
+
+describe('attachSymbol', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let cleanup: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ store, dbPath, cleanup } = await makeStore());
+  });
+
+  afterEach(async () => {
+    await cleanup();
+  });
+
+  it('attaches a symbol key to an existing memory', async () => {
+    const mem = await store.store({ content: 'attach test', category: 'learning', tags: [] });
+    const result = await store.attachSymbol({
+      symbolKey: 'ts|src/foo.ts|function|global|bar|0',
+      memoryId: mem.id,
+    });
+
+    expect(result.id).toBe(mem.id);
+    expect(result.symbolKey).toBe('ts|src/foo.ts|function|global|bar|0');
+
+    // Verify persisted.
+    const recent = await store.listRecent(10);
+    const found = recent.find(m => m.id === mem.id);
+    expect(found!.symbolKey).toBe('ts|src/foo.ts|function|global|bar|0');
+  });
+
+  it('upserts: overwrites previous symbol_key on same memory', async () => {
+    const mem = await store.store({ content: 'upsert test', category: 'learning', tags: [] });
+    await store.attachSymbol({ symbolKey: 'old-key', memoryId: mem.id });
+    await store.attachSymbol({ symbolKey: 'new-key', memoryId: mem.id });
+
+    const recent = await store.listRecent(10);
+    const found = recent.find(m => m.id === mem.id);
+    expect(found!.symbolKey).toBe('new-key');
+  });
+
+  it('throws MemoryNotFoundError for non-existent memory', async () => {
+    await expect(
+      store.attachSymbol({ symbolKey: 'key', memoryId: 'nonexistent' }),
+    ).rejects.toThrow('not found');
+  });
+
+  it('attaches a symbol key to a session summary', async () => {
+    const prompt = await store.storeSessionPrompt('sess-attach', 'prompt');
+    const summary = await store.storeSessionSummary({
+      sessionId: 'sess-attach',
+      promptId: prompt.id,
+      summary: 'summary to attach',
+    });
+
+    const result = await store.attachSymbol({
+      symbolKey: 'ts|src/mod.ts|class|module|MyClass|0',
+      sessionItemId: summary.id,
+    });
+
+    expect(result.id).toBe(summary.id);
+    expect(result.symbolKey).toBe('ts|src/mod.ts|class|module|MyClass|0');
+  });
+
+  it('throws for non-existent session item', async () => {
+    await expect(
+      store.attachSymbol({ symbolKey: 'key', sessionItemId: 'nonexistent' }),
+    ).rejects.toThrow('NOT_FOUND');
+  });
+});
+
+// ── T-v7: getBySymbol (PR #2) ──────────────────────────────────────
+
+describe('getBySymbol', () => {
+  let store: SqliteMemoryStore;
+  let cleanup: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ store, cleanup } = await makeStore());
+  });
+
+  afterEach(async () => {
+    await cleanup();
+  });
+
+  it('returns memories linked to a symbol key', async () => {
+    const mem = await store.store({ content: 'linked memory', category: 'architecture', tags: [] });
+    await store.attachSymbol({
+      symbolKey: 'ts|src/auth.ts|function|global|jwt|1',
+      memoryId: mem.id,
+    });
+
+    const results = await store.getBySymbol('ts|src/auth.ts|function|global|jwt|1');
+    expect(results.length).toBe(1);
+    expect(results[0].source).toBe('memory');
+    expect(results[0].content).toBe('linked memory');
+  });
+
+  it('returns empty array for unknown symbol key (not an error)', async () => {
+    const results = await store.getBySymbol('ts|src/missing.ts|function|global|nope|0');
+    expect(results).toEqual([]);
+  });
+
+  it('returns session summaries when source is included', async () => {
+    const prompt = await store.storeSessionPrompt('sess-get', 'prompt');
+    const summary = await store.storeSessionSummary({
+      sessionId: 'sess-get',
+      promptId: prompt.id,
+      summary: 'summary content',
+    });
+    await store.attachSymbol({
+      symbolKey: 'ts|src/s.ts|function|global|fn|0',
+      sessionItemId: summary.id,
+    });
+
+    const results = await store.getBySymbol('ts|src/s.ts|function|global|fn|0', {
+      sources: ['session_summary'],
+    });
+
+    expect(results.length).toBe(1);
+    expect(results[0].source).toBe('session_summary');
+    expect(results[0].content).toBe('summary content');
+  });
+
+  it('respects limit parameter', async () => {
+    const mem1 = await store.store({ content: 'first', category: 'learning', tags: [] });
+    const mem2 = await store.store({ content: 'second', category: 'learning', tags: [] });
+    await store.attachSymbol({ symbolKey: 'shared-key', memoryId: mem1.id });
+    await store.attachSymbol({ symbolKey: 'shared-key', memoryId: mem2.id });
+
+    const results = await store.getBySymbol('shared-key', { limit: 1 });
+    expect(results.length).toBe(1);
+  });
+
+  it('returns multiple sources in one query', async () => {
+    const mem = await store.store({ content: 'memory content', category: 'learning', tags: [] });
+    const prompt = await store.storeSessionPrompt('sess-multi', 'prompt');
+    const summary = await store.storeSessionSummary({
+      sessionId: 'sess-multi',
+      promptId: prompt.id,
+      summary: 'summary content',
+    });
+
+    await store.attachSymbol({ symbolKey: 'multi-key', memoryId: mem.id });
+    await store.attachSymbol({ symbolKey: 'multi-key', sessionItemId: summary.id });
+
+    const results = await store.getBySymbol('multi-key', {
+      sources: ['memory', 'session_summary'],
+    });
+
+    expect(results.length).toBe(2);
+    const sources = results.map(r => r.source);
+    expect(sources).toContain('memory');
+    expect(sources).toContain('session_summary');
+  });
+});

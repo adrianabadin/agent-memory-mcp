@@ -6,6 +6,7 @@ import {
   type SearchMode,
   type SearchResult,
   type StoreRequest,
+  type EnrichSymbolResult,
 } from './types.js';
 import type { SqliteMemoryStore } from './sqlite-store.js';
 import type { GlobalStore } from './global/global-store.js';
@@ -570,6 +571,97 @@ export function handlePurgeSessionItem(store: MemoryStore) {
   };
 }
 
+// ── Symbol-linked memory context tools (v7) ────────────────────────
+
+export function handleAttachSymbol(store: MemoryStore) {
+  return async (args: {
+    symbol_key: string;
+    memory_id?: string;
+    session_item_id?: string;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      if (!args.memory_id && !args.session_item_id) {
+        return error('Either memory_id or session_item_id must be provided');
+      }
+      const result = await store.attachSymbol({
+        symbolKey: args.symbol_key,
+        memoryId: args.memory_id,
+        sessionItemId: args.session_item_id,
+      });
+      return success(result);
+    } catch (err) {
+      return error(`attach_symbol failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleGetBySymbol(store: MemoryStore) {
+  return async (args: {
+    symbol_key: string;
+    sources?: string[];
+    limit?: number;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const results = await store.getBySymbol(args.symbol_key, {
+        sources: args.sources,
+        limit: args.limit,
+      });
+      return success({ count: results.length, results });
+    } catch (err) {
+      return error(`get_by_symbol failed: ${String(err)}`);
+    }
+  };
+}
+
+const MAX_ENRICH_SYMBOL_KEYS = 50;
+
+export function handleEnrichSymbols(store: MemoryStore, enrichmentResolver?: (symbolKey: string) => Promise<EnrichSymbolResult | null>) {
+  return async (args: {
+    symbol_keys: string[];
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      if (!Array.isArray(args.symbol_keys) || args.symbol_keys.length === 0) {
+        return error('symbol_keys must be a non-empty array');
+      }
+      if (args.symbol_keys.length > MAX_ENRICH_SYMBOL_KEYS) {
+        return error(`symbol_keys exceeds maximum of ${MAX_ENRICH_SYMBOL_KEYS}`);
+      }
+
+      const results: EnrichSymbolResult[] = [];
+      for (const key of args.symbol_keys) {
+        // Try the enrichment resolver first (PMC disk-based lookup).
+        if (enrichmentResolver) {
+          try {
+            const resolved = await enrichmentResolver(key);
+            if (resolved) {
+              results.push(resolved);
+              continue;
+            }
+          } catch {
+            // Resolver failed — fall through to not-found.
+          }
+        }
+
+        // Fallback: look up memories with matching symbolKey via the store.
+        const linked = await store.getBySymbol(key, { sources: ['memory'], limit: 1 });
+        if (linked.length > 0) {
+          results.push({
+            symbolKey: key,
+            found: true,
+            raw: linked[0].content,
+          });
+        } else {
+          results.push({ symbolKey: key, found: false });
+        }
+      }
+
+      return success({ results });
+    } catch (err) {
+      return error(`enrich_symbols failed: ${String(err)}`);
+    }
+  };
+}
+
 // ── Topic key suggestion (deterministic; queued version in PR-5) ───
 
 /**
@@ -895,6 +987,39 @@ export function registerTools(server: McpServer, store: MemoryStore, globalStore
       id: z.string().describe('ID of the session prompt / response / tool call / summary to hard-purge (irreversible)'),
     },
     handlePurgeSessionItem(store),
+  );
+
+  // ── Symbol-linked memory context tools (v7) ──────────────────────
+
+  server.tool(
+    'attach_symbol',
+    'Attach a symbol key to an existing memory or session-ledger record. Upserts — overwrites previous symbol_key on the same record. Returns { id, symbolKey }.',
+    {
+      symbol_key: z.string().describe('Soft symbol key (lang|path|kind|scope|name|arity)'),
+      memory_id: z.string().optional().describe('ID of the memory to attach the symbol key to'),
+      session_item_id: z.string().optional().describe('ID of the session prompt/response/tool_call/summary to attach the symbol key to'),
+    },
+    handleAttachSymbol(store),
+  );
+
+  server.tool(
+    'get_by_symbol',
+    'Retrieve all memories and session items linked to a symbol key. Returns { count, results } with per-record source, content, and metadata. Empty results for unknown keys (not an error).',
+    {
+      symbol_key: z.string().describe('Soft symbol key to look up'),
+      sources: z.array(z.enum(['memory', 'session_summary', 'session_prompt', 'session_response', 'session_tool_call'])).optional().describe('Sources to search (default: memory + session_summary)'),
+      limit: z.number().optional().describe('Max results to return (default 50)'),
+    },
+    handleGetBySymbol(store),
+  );
+
+  server.tool(
+    'enrich_symbols',
+    'Fetch semantic enrichment for one or more symbol keys. Returns per-symbol results with found flag and optional raw/structured enrichment. Batch never fails — unknown symbols return { found: false }.',
+    {
+      symbol_keys: z.array(z.string()).min(1).max(50).describe('Array of symbol keys to enrich (max 50)'),
+    },
+    handleEnrichSymbols(store),
   );
 
   // ── Global context tools (registered only when globalStore is provided) ──

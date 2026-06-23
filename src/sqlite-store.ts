@@ -2546,6 +2546,86 @@ export class SqliteMemoryStore implements MemoryStore {
     }
   }
 
+  // ── Symbol-linked memory context (v7) ──────────────────────────────
+
+  /**
+   * Attach a symbol key to an existing memory or session-ledger record.
+   * Upserts — overwrites the previous symbol_key on the same record.
+   * Throws MemoryNotFoundError if the target record does not exist.
+   */
+  async attachSymbol(opts: { symbolKey: string; memoryId?: string; sessionItemId?: string }): Promise<{ id: string; symbolKey: string }> {
+    const { symbolKey, memoryId, sessionItemId } = opts;
+
+    if (memoryId) {
+      // Verify the memory exists.
+      const mem = this.db.prepare('SELECT id FROM memories WHERE id = ?').get(memoryId) as { id: string } | undefined;
+      if (!mem) throw new MemoryNotFoundError(memoryId);
+      this.db.prepare('UPDATE memories SET symbol_key = ? WHERE id = ?').run(symbolKey, memoryId);
+      return { id: memoryId, symbolKey };
+    }
+
+    if (sessionItemId) {
+      // Detect which session table the id belongs to.
+      const { table } = this.detectSessionEntity(sessionItemId);
+      this.db.prepare(`UPDATE ${table} SET symbol_key = ? WHERE id = ?`).run(symbolKey, sessionItemId);
+      return { id: sessionItemId, symbolKey };
+    }
+
+    throw new Error('Either memoryId or sessionItemId must be provided');
+  }
+
+  /**
+   * Return all memories and session items linked to a symbol key.
+   * Sources default to ['memory', 'session_summary']. Soft-miss: returns
+   * empty array for unknown keys (never throws).
+   */
+  async getBySymbol(symbolKey: string, opts?: { sources?: string[]; limit?: number }): Promise<import('./types.js').SymbolLinkedResult[]> {
+    const sources = opts?.sources ?? ['memory', 'session_summary'];
+    const limit = opts?.limit ?? 50;
+    const results: import('./types.js').SymbolLinkedResult[] = [];
+
+    if (sources.includes('memory')) {
+      const rows = this.db.prepare(
+        `SELECT id, content, created_at FROM memories WHERE symbol_key = ? LIMIT ?`,
+      ).all(symbolKey, limit) as Array<{ id: string; content: string; created_at: string }>;
+      for (const row of rows) {
+        results.push({
+          id: row.id,
+          source: 'memory',
+          symbolKey,
+          content: row.content,
+          createdAt: row.created_at,
+        });
+      }
+    }
+
+    const sessionSourceMap: Record<string, { table: string; contentCol: string }> = {
+      session_summary: { table: 'session_summaries', contentCol: 'summary' },
+      session_prompt: { table: 'session_prompts', contentCol: 'raw_prompt' },
+      session_response: { table: 'session_responses', contentCol: 'full_response' },
+      session_tool_call: { table: 'session_tool_calls', contentCol: 'result_summary' },
+    };
+
+    for (const source of sources) {
+      const meta = sessionSourceMap[source];
+      if (!meta) continue;
+      const rows = this.db.prepare(
+        `SELECT id, ${meta.contentCol} as content, created_at FROM ${meta.table} WHERE symbol_key = ? LIMIT ?`,
+      ).all(symbolKey, limit) as Array<{ id: string; content: string; created_at: string }>;
+      for (const row of rows) {
+        results.push({
+          id: row.id,
+          source: source as import('./types.js').SymbolLinkedResult['source'],
+          symbolKey,
+          content: row.content ?? '',
+          createdAt: row.created_at,
+        });
+      }
+    }
+
+    return results.slice(0, limit);
+  }
+
   // ── Auto-link helper (T-004 / PR-2) ──────────────────────────────────
 
   /**
