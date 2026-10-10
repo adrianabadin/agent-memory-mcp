@@ -369,6 +369,10 @@ export interface StoreResult {
   stored?: Memory;
   judgment_required: boolean;
   candidates?: CandidateMemory[];
+  /** Durable pending-draft ID (blocked store): judge() resolves it via judgment_ids. */
+  draft_id?: string;
+  /** One judgment ID per candidate, format 'draftId:candidateId'. */
+  judgment_ids?: string[];
 }
 
 /** Result of compare() — semantic comparison between two memories. */

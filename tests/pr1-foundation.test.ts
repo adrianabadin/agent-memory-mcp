@@ -591,3 +591,80 @@ describe('T-008: listReviewQueue SQL regression (R3: LIMIT must not be a WHERE p
     expect(filtered.count).toBe(2);
   });
 });
+
+// ── R3: conflict-flow deadlock fix — durable pending drafts ──────────
+
+describe('R3: durable pending conflict drafts', () => {
+  async function blockedDraft(prefix: string, preexisting = false) {
+    const dbPath = join(await mkdtemp(join(tmpdir(), prefix)), 'test.db');
+    const store = new SqliteMemoryStore(dbPath, new MockEmbedder());
+    await store.initialize();
+    const cleanup = async () => { store.close(); await rm(join(dbPath, '..'), { recursive: true, force: true }); };
+    await store.store({ id: 'cand-a', content: 'duplicate content about foxes jumping over lazy dogs', category: 'learning', tags: [] });
+    await store.store({ id: 'cand-b', content: 'duplicate content about foxes jumping over lazy dogs today', category: 'learning', tags: [] });
+    if (preexisting) await store.store({ id: 'ns:draft-x', content: 'original committed foxes content', category: 'learning', tags: [] });
+    const request = { id: 'ns:draft-x', content: 'duplicate content about foxes jumping over lazy dogs again', category: 'learning' as const,
+      tags: [], detect_conflicts: true, conflict_threshold: 0.5, topicKey: 'r3-topic' };
+    const blocked = await store.store(request) as any;
+    return { store, request, blocked, dbPath, cleanup };
+  }
+
+  it('persists blocked drafts outside retrieval, survives restart, activates only after all judgments', async () => {
+    const { store, request, blocked, dbPath, cleanup } = await blockedDraft('amm-pr1-r3-draft-');
+    try {
+      expect(blocked.judgment_required).toBe(true);
+      expect([blocked.draft_id, ...[...blocked.judgment_ids].sort()]).toEqual(['ns:draft-x', 'ns:draft-x:cand-a', 'ns:draft-x:cand-b']);
+      // Pending draft is NOT ordinary/search-visible memory.
+      expect((await store.stats()).totalMemories).toBe(2);
+      expect((await store.search('duplicate content about foxes', 'keyword', { status: 'all' })).find(r => r.memory.id === 'ns:draft-x')).toBeUndefined();
+      // Durable across restart; one of two judgments must NOT activate.
+      store.close();
+      const reopened = new SqliteMemoryStore(dbPath, new MockEmbedder());
+      await reopened.initialize();
+      expect((await reopened.judge('ns:draft-x:cand-a', 'not_conflict')).persisted).toBe(true);
+      expect((await reopened.stats()).totalMemories).toBe(2);
+      // Final judgment activates; resolved judgments materialize with real FKs.
+      expect((await reopened.judge('ns:draft-x:cand-b', 'not_conflict')).persisted).toBe(true);
+      expect((await reopened.stats()).totalMemories).toBe(3);
+      expect(reopened.getMemoryRelation('ns:draft-x', 'cand-a')?.relation).toBe('not_conflict');
+      expect(reopened.getMemoryRelation('ns:draft-x', 'cand-b')?.relation).toBe('not_conflict');
+      expect((reopened.getDb().prepare('SELECT COUNT(*) AS n FROM conflict_drafts').get() as { n: number }).n).toBe(0);
+      // Re-store after resolution: idempotent, no re-block.
+      expect(((await reopened.store(request)) as any).judgment_required).toBe(false);
+      reopened.close();
+    } finally { await cleanup(); }
+  });
+
+  it('rolls back the judgment on activation failure (retryable) and merges a pre-existing ID', async () => {
+    const { store, cleanup } = await blockedDraft('amm-pr1-r3-rollback-', true);
+    try {
+      expect((await store.judge('ns:draft-x:cand-b', 'not_conflict')).persisted).toBe(true);
+      // Injected failure: remove a candidate so relation INSERT hits its FK mid-activation.
+      store.getDb().exec("DELETE FROM memories WHERE id = 'cand-a'");
+      await expect(store.judge('ns:draft-x:cand-a', 'not_conflict')).rejects.toThrow();
+      // Judgment rolled back WITH the failed activation → retry stays possible.
+      expect((store.getDb().prepare("SELECT resolution FROM conflict_draft_judgments WHERE id = 'ns:draft-x:cand-a'").get() as any).resolution).toBeNull();
+      store.getDb().exec("INSERT INTO memories (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version) VALUES ('cand-a', 'restored', 'learning', '[]', '2020-01-01', '2020-01-01', 0, '2020-01-01', 1)");
+      expect((await store.judge('ns:draft-x:cand-a', 'not_conflict')).persisted).toBe(true);
+      // Pre-existing ns:draft-x keeps legacy update semantics: content+vector consistent, version++.
+      const row = store.getDb().prepare('SELECT content, version FROM memories WHERE id = ?').get('ns:draft-x') as any;
+      expect([row.content, row.version]).toEqual(['duplicate content about foxes jumping over lazy dogs again', 2]); // legacy merge semantics
+    } finally { await cleanup(); }
+  });
+
+  it('keeps a confirmed conflicts_with draft NONACTIVE and re-judgeable for revision', async () => {
+    const { store, cleanup } = await blockedDraft('amm-pr1-r3-neg-');
+    try {
+      await store.judge('ns:draft-x:cand-a', 'conflicts_with', 'confirmed duplicate');
+      await store.judge('ns:draft-x:cand-b', 'not_conflict');
+      // All judged, but a confirmed conflict keeps the draft NONACTIVE — never erased.
+      expect((await store.stats()).totalMemories).toBe(2);
+      expect((store.getDb().prepare('SELECT COUNT(*) AS n FROM conflict_drafts').get() as { n: number }).n).toBe(1);
+      // Deliberate revision of the negative verdict: flip to not_conflict → activation.
+      await store.judge('ns:draft-x:cand-a', 'not_conflict');
+      expect((await store.stats()).totalMemories).toBe(3);
+      expect(store.getMemoryRelation('ns:draft-x', 'cand-a')?.relation).toBe('not_conflict');
+      expect((await store.resolveTopic('r3-topic'))?.id).toBe('ns:draft-x');
+    } finally { await cleanup(); }
+  });
+});

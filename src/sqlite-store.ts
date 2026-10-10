@@ -1180,6 +1180,18 @@ export class SqliteMemoryStore implements MemoryStore {
       `);
       this.db.exec('PRAGMA user_version = 9');
     }
+
+    // ── R3 conflict-flow fix — durable pending drafts (no user_version bump: the v9 contract is pinned by existing suites).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS conflict_drafts (
+        id TEXT PRIMARY KEY, request TEXT NOT NULL, embedding BLOB NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS conflict_draft_judgments (
+        id TEXT PRIMARY KEY, draft_id TEXT NOT NULL REFERENCES conflict_drafts(id) ON DELETE CASCADE,
+        candidate_id TEXT NOT NULL, resolution TEXT, confidence REAL, reasoning TEXT, created_at TEXT NOT NULL, resolved_at TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_draft_judgments_pair ON conflict_draft_judgments(draft_id, candidate_id);
+    `);
   }
 
   /**
@@ -1635,9 +1647,11 @@ export class SqliteMemoryStore implements MemoryStore {
     // The caller must judge (not_conflict → re-call store) or resolve otherwise.
     if (request.detect_conflicts) {
       const threshold = request.conflict_threshold ?? parseFloat(process.env.MEMORY_CONFLICT_THRESHOLD ?? '0.92');
-      const candidates = this.detectCollisions(embedding, threshold, request.content);
+      const candidates = this.detectCollisions(embedding, threshold, request.content, id);
       if (candidates.length > 0) {
-        return { judgment_required: true, candidates };
+        // R3 fix: durable pending draft OUTSIDE retrieval; judge() resolves it after restart.
+        const judgment_ids = this.persistConflictDraft(id, request, now, embedding, candidates);
+        return { judgment_required: true, candidates, draft_id: id, judgment_ids };
       }
       const stored = await this._doStore(id, request, now, tags, embedding, provenance, requestedStatus);
       return { stored, judgment_required: false };
@@ -1743,20 +1757,24 @@ export class SqliteMemoryStore implements MemoryStore {
    *
    * Runs cosine-similarity query against same-project memories. For each
    * candidate: if cosine > threshold AND FTS title overlap >= 60%, include
-   * in results. Returns candidates sorted by similarity descending.
+   * in results. Returns candidates sorted by similarity descending. With a
+   * prospectiveId, the prospective row and already-judged pairs are excluded.
    */
   private detectCollisions(
     queryEmbedding: number[],
     threshold: number,
     content: string,
+    prospectiveId?: string,
   ): CandidateMemory[] {
     // Fetch all existing embeddings + metadata
     const rows = this.db.prepare(
       `SELECT m.id, m.content, m.created_at, e.embedding
        FROM memories m
        JOIN memory_embeddings e ON e.id = m.id
-       WHERE m.status != 'archived'`,
-    ).all() as Array<{
+       WHERE m.status != 'archived'
+         AND (? IS NULL OR (m.id != ? AND NOT EXISTS (
+           SELECT 1 FROM memory_relations r WHERE (r.memory_id_a = ? AND r.memory_id_b = m.id) OR (r.memory_id_b = ? AND r.memory_id_a = m.id))))`,
+    ).all(prospectiveId ?? null, prospectiveId ?? null, prospectiveId ?? null, prospectiveId ?? null) as Array<{
       id: string;
       content: string;
       created_at: string;
@@ -1984,6 +2002,29 @@ export class SqliteMemoryStore implements MemoryStore {
     const newId = judgmentId.slice(0, colonIdx);
     const existingId = judgmentId.slice(colonIdx + 1);
 
+    // R3 fix: EXACT judgment-row lookup (PK — no ambiguous ':' split for namespaced IDs).
+    // ONE transaction: judgment update, pending count, activation, removal — failure
+    // rolls back (retryable). conflicts_with keeps the draft NONACTIVE, re-judgeable.
+    const j = this.db.prepare('SELECT draft_id FROM conflict_draft_judgments WHERE id = ?').get(judgmentId) as { draft_id: string } | undefined;
+    if (j) {
+      this.db.exec('BEGIN');
+      try {
+        this.db.prepare('UPDATE conflict_draft_judgments SET resolution = ?, confidence = ?, reasoning = ?, resolved_at = ? WHERE id = ?')
+          .run(relation, confidence ?? null, reasoning ?? null, new Date().toISOString(), judgmentId);
+        const { pending, neg } = this.db.prepare(
+          `SELECT SUM(resolution IS NULL) AS pending, SUM(resolution = 'conflicts_with') AS neg FROM conflict_draft_judgments WHERE draft_id = ?`,
+        ).get(j.draft_id) as { pending: number; neg: number };
+        let cascaded = false; let topicKey: string | undefined;
+        if (pending === 0 && !neg) ({ cascaded, topicKey } = this.activateDraft(j.draft_id));
+        this.db.exec('COMMIT');
+        if (topicKey) await this.upsertTopicAlias(topicKey, j.draft_id);
+        return { persisted: true, relation, ...(cascaded ? { cascaded: 'archived' as const } : {}) };
+      } catch (e) {
+        this.db.exec('ROLLBACK');
+        throw e;
+      }
+    }
+
     // Verify both memories exist
     const newMem = this.db.prepare('SELECT id FROM memories WHERE id = ?').get(newId) as { id: string } | undefined;
     if (!newMem) throw new MemoryNotFoundError(newId);
@@ -2006,6 +2047,74 @@ export class SqliteMemoryStore implements MemoryStore {
     }
 
     return { persisted: true, relation, ...(cascaded ? { cascaded } : {}) };
+  }
+
+  /** R3 fix: persist (idempotently) a pending draft + one pending judgment per candidate,
+   * in tables OUTSIDE memories/memory_embeddings (invisible to retrieval). */
+  private persistConflictDraft(
+    id: string, request: StoreRequest, now: string, embedding: number[], candidates: CandidateMemory[],
+  ): string[] {
+    this.db.exec('BEGIN');
+    try {
+      this.db.prepare(
+        `INSERT INTO conflict_drafts (id, request, embedding, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET request = excluded.request, embedding = excluded.embedding`,
+      ).run(id, JSON.stringify(request), embeddingToBlob(embedding), now);
+      // Deterministic retry: replace any prior pending judgments for this draft.
+      this.db.prepare('DELETE FROM conflict_draft_judgments WHERE draft_id = ?').run(id);
+      const judgmentIds = candidates.map(c => `${id}:${c.id}`);
+      const insertJudgment = this.db.prepare('INSERT INTO conflict_draft_judgments (id, draft_id, candidate_id, created_at) VALUES (?, ?, ?, ?)');
+      for (let i = 0; i < candidates.length; i++) insertJudgment.run(judgmentIds[i], id, candidates[i].id, now);
+      this.db.exec('COMMIT');
+      return judgmentIds;
+    } catch (e) {
+      this.db.exec('ROLLBACK');
+      throw e;
+    }
+  }
+
+  /**
+   * R3 fix: activate a fully-judged, non-conflicting draft INSIDE the caller's transaction.
+   * Upsert keeps legacy _doStore row semantics (created_at kept; version++, COALESCE provenance,
+   * explicit-status-only for pre-existing IDs); topicKey alias applied post-commit by the caller.
+   */
+  private activateDraft(draftId: string): { cascaded: boolean; topicKey?: string } {
+    const d = this.db.prepare('SELECT request, embedding, created_at FROM conflict_drafts WHERE id = ?')
+      .get(draftId) as { request: string; embedding: Buffer; created_at: string } | undefined;
+    if (!d) throw new Error(`No pending draft '${draftId}'`);
+    const req = JSON.parse(d.request) as StoreRequest;
+    const tags = JSON.stringify(req.tags ?? []); const p = req.provenance;
+    this.db.prepare(
+      `INSERT INTO memories (id, content, category, tags, created_at, updated_at, access_count, last_accessed_at, version, origin, source_tool, session_id, content_hash, status)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET content = excluded.content, category = excluded.category, tags = excluded.tags,
+         updated_at = excluded.updated_at, version = memories.version + 1, origin = COALESCE(excluded.origin, memories.origin),
+         source_tool = COALESCE(excluded.source_tool, memories.source_tool), session_id = COALESCE(excluded.session_id, memories.session_id),
+         content_hash = COALESCE(excluded.content_hash, memories.content_hash), status = CASE WHEN ? IS NOT NULL THEN ? ELSE memories.status END`,
+    ).run(
+      draftId, req.content, req.category, tags, d.created_at, d.created_at, d.created_at,
+      p?.origin ?? 'unknown', p?.sourceTool ?? null, p?.sessionId ?? null, p?.contentHash ?? null,
+      req.status ?? 'active', req.status ?? null, req.status ?? null,
+    );
+    this.db.prepare('INSERT OR REPLACE INTO memory_embeddings (id, embedding) VALUES (?, ?)').run(draftId, d.embedding);
+    let cascaded = false;
+    for (const j of this.db.prepare(
+      'SELECT candidate_id, resolution, confidence, reasoning FROM conflict_draft_judgments WHERE draft_id = ? AND resolution IS NOT NULL',
+    ).all(draftId) as Array<{ candidate_id: string; resolution: RelationType; confidence: number | null; reasoning: string | null }>) {
+      this.addMemoryRelation({
+        memoryIdA: draftId, memoryIdB: j.candidate_id, relation: j.resolution,
+        confidence: j.confidence ?? undefined, reasoning: j.reasoning ?? undefined, markedBy: 'judge',
+      });
+      if (j.resolution === 'supersedes') {
+        const at = new Date().toISOString();
+        this.db.prepare(
+          `UPDATE memories SET status = 'archived', review_reason = ?, reviewed_at = ?, updated_at = ?, version = version + 1 WHERE id = ?`,
+        ).run(`superseded by ${draftId}`, at, at, at, j.candidate_id);
+        cascaded = true;
+      }
+    }
+    this.db.prepare('DELETE FROM conflict_drafts WHERE id = ?').run(draftId);
+    return { cascaded, ...(req.topicKey ? { topicKey: req.topicKey } : {}) };
   }
 
   // ── Review queue (v9 T-008) ─────────────────────────────────────
