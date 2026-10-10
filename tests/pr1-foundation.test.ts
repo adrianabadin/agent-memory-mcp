@@ -546,3 +546,48 @@ describe('T-002: Memory lifecycle fields round-trip', () => {
     expect(mem!.reviewReason).toBe('stale');
   });
 });
+
+describe('T-008: listReviewQueue SQL regression (R3: LIMIT must not be a WHERE predicate)', () => {
+  let store: SqliteMemoryStore;
+  let dbPath: string;
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'amm-pr1-review-queue-'));
+    dbPath = join(tmpDir, 'test.db');
+    store = new SqliteMemoryStore(dbPath, new MockEmbedder());
+    await store.initialize();
+  });
+
+  afterEach(async () => {
+    store.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it('SQL review queue returns only needs_review rows, ordered by reviewed_at, limited', async () => {
+    await store.store({ id: 'rq-1', content: 'queue one', category: 'learning', tags: [] } as any);
+    await store.store({ id: 'rq-2', content: 'queue two', category: 'learning', tags: [] } as any);
+    await store.store({ id: 'rq-3', content: 'queue three active', category: 'learning', tags: [] } as any);
+
+    // Mark two rows as needing review; leave rq-3 active to verify exclusion.
+    const db = new DatabaseSync(dbPath);
+    db.prepare(`UPDATE memories SET status = 'needs_review', reviewed_at = ? WHERE id = ?`)
+      .run('2024-01-02T00:00:00.000Z', 'rq-1');
+    db.prepare(`UPDATE memories SET status = 'needs_review', reviewed_at = ? WHERE id = ?`)
+      .run('2024-01-01T00:00:00.000Z', 'rq-2');
+    db.close();
+
+    // Limit is a SQL clause after ORDER BY, not a WHERE predicate.
+    const limited = await store.listReviewQueue({ limit: 1 });
+    expect(limited.count).toBe(1);
+    expect(limited.items[0]!.id).toBe('rq-2');
+
+    const full = await store.listReviewQueue();
+    expect(full.count).toBe(2);
+    expect(full.items.map(m => m.id)).toEqual(['rq-2', 'rq-1']);
+
+    // Project filter is a reserved no-op and must not break the query.
+    const filtered = await store.listReviewQueue({ projectId: 'proj-x', limit: 10 });
+    expect(filtered.count).toBe(2);
+  });
+});

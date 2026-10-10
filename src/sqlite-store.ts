@@ -2025,12 +2025,10 @@ export class SqliteMemoryStore implements MemoryStore {
       // For now, it's a no-op filter on the memory table.
     }
 
-    conditions.push('LIMIT ?');
-    args.push(limit);
-
+    // LIMIT is a SQL clause appended after ORDER BY, never a WHERE predicate.
     const rows = this.db.prepare(
-      `SELECT * FROM memories WHERE ${conditions.join(' AND ')} ORDER BY reviewed_at ASC, created_at ASC`,
-    ).all(...args) as unknown as MemoryRow[];
+      `SELECT * FROM memories WHERE ${conditions.join(' AND ')} ORDER BY reviewed_at ASC, created_at ASC LIMIT ?`,
+    ).all(...args, limit) as unknown as MemoryRow[];
 
     return { count: rows.length, items: rows.map(rowToMemory) };
   }
