@@ -668,3 +668,43 @@ describe('R3: durable pending conflict drafts', () => {
     } finally { await cleanup(); }
   });
 });
+
+// ── R3-001: decay auto-flag regression (archived status preservation) ─
+
+describe('R3-001: decay auto-flag must not resurrect archived memories', () => {
+  it('preserves archived status across single transition and batch decay, auto-flagging only active', async () => {
+    const dbPath = join(await mkdtemp(join(tmpdir(), 'amm-pr1-r3-001-')), 'test.db');
+    const store = new SqliteMemoryStore(dbPath, new MockEmbedder());
+    await store.initialize();
+    try {
+      const cfg = { coolingAfterDays: 0, dimmedAfterDays: 0, shadowAfterDays: 180, gistCandidateAfterDays: 365, gistOnlyRetentionDays: 90 };
+      // 1. Single targeted transition
+      await store.store({ id: 'arch-single', content: 'unique resurrection test single', category: 'learning', tags: [] } as any);
+      await store.updateMemoryStatus('arch-single', 'archived', 'superseded');
+      await store.store({ id: 'act-single', content: 'unique active test single', category: 'learning', tags: [] } as any);
+
+      store.transitionDecayStateForMemory('arch-single', cfg);
+      store.transitionDecayStateForMemory('act-single', cfg);
+
+      const db = store.getDb();
+      expect((db.prepare('SELECT status FROM memories WHERE id = ?').get('arch-single') as any).status).toBe('archived');
+      expect((await store.search('resurrection test single', 'keyword', {})).find(r => r.memory.id === 'arch-single')).toBeUndefined();
+      expect((db.prepare('SELECT status FROM memories WHERE id = ?').get('act-single') as any).status).toBe('needs_review');
+
+      // 2. Batch decay
+      await store.store({ id: 'arch-batch', content: 'unique resurrection test batch', category: 'learning', tags: [] } as any);
+      await store.updateMemoryStatus('arch-batch', 'archived', 'superseded');
+      await store.store({ id: 'act-batch', content: 'unique active test batch', category: 'learning', tags: [] } as any);
+
+      store.evaluateAllMemoriesForDecay(cfg);
+
+      expect((db.prepare('SELECT status FROM memories WHERE id = ?').get('arch-batch') as any).status).toBe('archived');
+      expect((await store.search('resurrection test batch', 'keyword', {})).find(r => r.memory.id === 'arch-batch')).toBeUndefined();
+      expect((db.prepare('SELECT status FROM memories WHERE id = ?').get('act-batch') as any).status).toBe('needs_review');
+    } finally {
+      store.close();
+      await rm(join(dbPath, '..'), { recursive: true, force: true });
+    }
+  });
+});
+

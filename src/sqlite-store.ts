@@ -1326,7 +1326,7 @@ export class SqliteMemoryStore implements MemoryStore {
       // T-008: Auto-flag for review when transitioning to dimmed/shadow/gist_only
       if (shouldAutoFlagForReview(result.newState, currentState)) {
         this.db.prepare(
-          `UPDATE memories SET status = 'needs_review', review_reason = ?, reviewed_at = ? WHERE id = ?`,
+          `UPDATE memories SET status = 'needs_review', review_reason = ?, reviewed_at = ? WHERE id = ? AND status != 'archived'`,
         ).run(`decay: ${result.newState}`, new Date().toISOString(), memoryId);
       }
     }
@@ -1455,7 +1455,7 @@ export class SqliteMemoryStore implements MemoryStore {
         // Pinned and non_forgettable memories are already excluded by the query above.
         if (shouldAutoFlagForReview(result.newState, fromState)) {
           this.db.prepare(
-            `UPDATE memories SET status = 'needs_review', review_reason = ?, reviewed_at = ? WHERE id = ?`,
+            `UPDATE memories SET status = 'needs_review', review_reason = ?, reviewed_at = ? WHERE id = ? AND status != 'archived'`,
           ).run(`decay: ${result.newState}`, new Date().toISOString(), memoryId);
         }
       }
