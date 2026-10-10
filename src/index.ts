@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { EmbeddingCache } from './embedding-cache.js';
-import { TransformersEmbedder } from './embedder.js';
+import { createProjectEmbedder, createGlobalEmbedder } from './embedder.js';
 import { HardcopyMemoryStore } from './hardcopy-store.js';
 import { createStore } from './store-factory.js';
 import { createServer } from './server.js';
@@ -15,14 +14,9 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const modelName = process.env.EMBEDDING_MODEL ?? 'Xenova/bge-m3';
-  const dimensions = process.env.EMBEDDING_DIMENSIONS ? parseInt(process.env.EMBEDDING_DIMENSIONS, 10) : undefined;
-  const pooling = process.env.EMBEDDING_POOLING ?? undefined;
-  const cachePath = process.env.EMBEDDING_CACHE_PATH;
-
   // ── Compose dependencies ──
-  const cache = cachePath ? new EmbeddingCache(cachePath, modelName) : undefined;
-  const embedder = new TransformersEmbedder(modelName, dimensions, pooling, cache);
+  // Project embedder follows the standard env vars (may be a 384-dim E5).
+  const embedder = createProjectEmbedder();
   let store: MemoryStore = await createStore(dbPath, embedder);
 
   if (process.env.ENABLE_HARDCOPY === 'true' && process.env.HARDCOPY_PATH) {
@@ -31,7 +25,10 @@ async function main(): Promise<void> {
   }
 
   // ── Global context store (optional — failure does not block startup) ──
-  const globalStore = await createGlobalStore(embedder);
+  // ALWAYS an independent BGE-M3 1024 embedder with its own cache: the global
+  // DB stores 1024-dim BGE vectors and must never inherit the project model.
+  const globalEmbedder = createGlobalEmbedder();
+  const globalStore = await createGlobalStore(globalEmbedder);
   if (globalStore) {
     console.error(`[global] Global context store ready`);
   }
@@ -40,6 +37,14 @@ async function main(): Promise<void> {
 
   // ── Initialise (download model on first run, connect to DB) ──
   await embedder.initialize();
+  if (globalStore) {
+    try {
+      await globalEmbedder.initialize();
+    } catch (err) {
+      // Preserve the "global failure does not block startup" contract.
+      console.error('[global] Embedder initialisation failed; global semantic ops degraded:', err);
+    }
+  }
 
   // ── Start MCP transport ──
   const transport = new StdioServerTransport();

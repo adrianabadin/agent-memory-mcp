@@ -1,16 +1,18 @@
-import { TransformersEmbedder } from './embedder.js';
-import { EmbeddingCache } from './embedding-cache.js';
+import { createProjectEmbedder, createGlobalEmbedder } from './embedder.js';
 import { createStore } from './store-factory.js';
 import { createGlobalStore } from './global/global-factory.js';
+import { DatabaseSync } from 'node:sqlite';
 import type {
   Embedder,
+  EmbeddingIdentity,
+  EmbeddingRole,
   MemoryStore,
   SessionPrompt,
   SessionResponse,
   SessionToolCall,
 } from './types.js';
 import type { GlobalStore } from './global/global-store.js';
-import { SqliteMemoryStore } from './sqlite-store.js';
+import { SqliteMemoryStore, readEmbeddingIdentity, LEGACY_EXPECTED_DIMENSIONS } from './sqlite-store.js';
 
 // Re-export the composition primitives so consumers (the unified `pmc` server)
 // can import everything they need from a single side-effect-free entry point,
@@ -18,8 +20,8 @@ import { SqliteMemoryStore } from './sqlite-store.js';
 // package is invoked as a bin.
 export { createServer } from './server.js';
 export { registerTools } from './tools.js';
-export { TransformersEmbedder } from './embedder.js';
-export type { Embedder, MemoryStore } from './types.js';
+export { TransformersEmbedder, createProjectEmbedder, createGlobalEmbedder } from './embedder.js';
+export type { Embedder, EmbeddingIdentity, EmbeddingRole, MemoryStore } from './types.js';
 export type { GlobalStore } from './global/global-store.js';
 
 /**
@@ -58,14 +60,19 @@ export class LazyEmbedder implements Embedder {
     return this.ready;
   }
 
-  async embed(text: string): Promise<number[]> {
+  async embed(text: string, role: EmbeddingRole = 'passage'): Promise<number[]> {
     await this.ensureReady();
-    return this.inner.embed(text);
+    return this.inner.embed(text, role);
   }
 
-  async embedBatch(texts: string[]): Promise<number[][]> {
+  async embedBatch(texts: string[], role: EmbeddingRole = 'passage'): Promise<number[][]> {
     await this.ensureReady();
-    return this.inner.embedBatch(texts);
+    return this.inner.embedBatch(texts, role);
+  }
+
+  /** Delegates identity WITHOUT initializing the model (DB guard needs it at open). */
+  identity(): EmbeddingIdentity | undefined {
+    return this.inner.identity?.();
   }
 
   dimensions(): number {
@@ -94,38 +101,39 @@ export interface MemoryComponents {
  * does NOT download the embedding model. The embedder is wrapped in
  * {@link LazyEmbedder} so the model is only fetched on the first `store`/`search`.
  *
+ * The GLOBAL error store always gets its own independent BGE-M3 1024 embedder
+ * (separate cache), never the project embedder: the project may run a 384-dim
+ * E5 model while the global DB holds 1024-dim BGE vectors.
+ *
  * Intended for composition: the unified `pmc` server calls this, then
  * `registerTools(server, components.store, components.globalStore ?? undefined)`
  * on a shared McpServer that also hosts query tools.
  *
- * @param options.dbPath     Base path for the memory SQLite DB (REQUIRED).
- * @param options.embedder   Optional injected embedder (used by tests). When
- *                           omitted, a real TransformersEmbedder is constructed
- *                           from the standard embedding env vars.
+ * @param options.dbPath          Base path for the memory SQLite DB (REQUIRED).
+ * @param options.embedder        Optional injected project embedder (tests).
+ * @param options.globalEmbedder  Optional injected global embedder (tests).
  */
 export async function buildMemoryComponents(options: {
   dbPath: string;
   embedder?: Embedder;
+  globalEmbedder?: Embedder;
 }): Promise<MemoryComponents> {
   const dbPath = options?.dbPath;
   if (!dbPath) {
     throw new Error('buildMemoryComponents requires a dbPath');
   }
 
-  const modelName = process.env.EMBEDDING_MODEL ?? 'Xenova/bge-m3';
-  const dimensions = process.env.EMBEDDING_DIMENSIONS
-    ? parseInt(process.env.EMBEDDING_DIMENSIONS, 10)
-    : undefined;
-  const pooling = process.env.EMBEDDING_POOLING ?? undefined;
-  const cachePath = process.env.EMBEDDING_CACHE_PATH;
-  const cache = cachePath ? new EmbeddingCache(cachePath, modelName) : undefined;
-
   const baseEmbedder =
-    options.embedder ?? new TransformersEmbedder(modelName, dimensions, pooling, cache);
+    options.embedder ?? createProjectEmbedder();
   const embedder = new LazyEmbedder(baseEmbedder);
 
   const store = await createStore(dbPath, embedder);
-  const globalStore = await createGlobalStore(embedder);
+
+  // Independent global embedder: BGE-M3 1024, own cache — never inherits the
+  // project (possibly E5 384) embedder.
+  const globalBase = options.globalEmbedder ?? createGlobalEmbedder();
+  const globalEmbedder = new LazyEmbedder(globalBase);
+  const globalStore = await createGlobalStore(globalEmbedder);
 
   return { store, globalStore, embedder };
 }
@@ -170,18 +178,58 @@ export interface LedgerStore {
 }
 
 /**
- * No-op embedder used by {@link createLedgerOnlyStore}. The session-ledger
+ * No-model embedder used by {@link createLedgerOnlyStore}. The session-ledger
  * write path calls `embedder.embed(...)` for every row, but the drainer does
  * not need real vectors (the capture pipeline never runs semantic search on
- * raw session items directly). Returning an empty vector avoids the embedding
- * model download entirely, so the drainer boots instantly.
+ * raw session items directly). Returning an EMPTY vector marks the row
+ * "pending": the ledger write path stores NULL — never a zero-byte blob — and
+ * a later real embedding pass overwrites it with a proper vector.
+ *
+ * Dimensions (and identity when available) are DERIVED, never guessed:
+ *   1. the DB's own `embedding_meta` stamp (authoritative — no model string
+ *      guessing when metadata exists);
+ *   2. else project configuration (`EMBEDDING_DIMENSIONS`);
+ *   3. else the known legacy 1024-dim baseline.
+ * This keeps the open-time guard/audit satisfied on E5-stamped databases
+ * (384) as well as legacy BGE databases (1024) — WITHOUT any model load,
+ * tokenizer, inference, or network on the ledger-only path.
  */
-const dummyEmbedder: Embedder = {
-  initialize: async () => {},
-  embed: async () => [],
-  embedBatch: async () => [],
-  dimensions: () => 1024,
-};
+function createLedgerPendingEmbedder(sqlitePath: string): Embedder {
+  let stamped: ReturnType<typeof readEmbeddingIdentity> = null;
+  try {
+    const probe = new DatabaseSync(sqlitePath);
+    try {
+      stamped = readEmbeddingIdentity(probe);
+    } finally {
+      probe.close();
+    }
+  } catch {
+    // Unreadable/missing DB: fall back to configuration-derived dims below.
+  }
+  const dims = stamped?.dimensions
+    ?? (process.env.EMBEDDING_DIMENSIONS
+      ? parseInt(process.env.EMBEDDING_DIMENSIONS, 10)
+      : LEGACY_EXPECTED_DIMENSIONS);
+  const stampedIdentity = stamped;
+  return {
+    initialize: async () => {},
+    embed: async () => [], // pending → stored as NULL
+    embedBatch: async (texts) => texts.map(() => []),
+    dimensions: () => dims,
+    ...(stampedIdentity
+      ? {
+          identity: () => ({
+            model: stampedIdentity.model,
+            dimensions: stampedIdentity.dimensions,
+            pooling: stampedIdentity.pooling,
+            normalize: stampedIdentity.normalize,
+            roleAware: stampedIdentity.roleAware,
+            chunkPolicy: stampedIdentity.chunkPolicy,
+          }),
+        }
+      : {}),
+  };
+}
 
 /**
  * Build a ledger-only store over `SqliteMemoryStore` for the session-capture
@@ -227,7 +275,7 @@ const dummyEmbedder: Embedder = {
 export async function createLedgerOnlyStore(dbPath: string): Promise<LedgerStore> {
   // Match the path convention used by the main store: append `.db`.
   const sqlitePath = `${dbPath}.db`;
-  const store = new SqliteMemoryStore(sqlitePath, dummyEmbedder);
+  const store = new SqliteMemoryStore(sqlitePath, createLedgerPendingEmbedder(sqlitePath));
   await store.initialize();
 
   // Enforce a 5s busy_timeout so the drainer survives transient lock

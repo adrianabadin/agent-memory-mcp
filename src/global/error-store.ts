@@ -146,7 +146,7 @@ export class ErrorStore {
     const files = req.files ? JSON.stringify(req.files) : null;
 
     const embeddingText = [req.message, req.rootCause, req.fix].filter(Boolean).join('\n');
-    const embedding = await this.embedder.embed(embeddingText);
+    const embedding = await this.embedder.embed(embeddingText, 'passage');
 
     this.db.exec('BEGIN');
     try {
@@ -214,7 +214,7 @@ export class ErrorStore {
       // FTS error (e.g. empty table) — continue with semantic only
     }
 
-    const queryVec = await this.embedder.embed(query);
+    const queryVec = await this.embedder.embed(query, 'query');
     const embeddingRows = this.db.prepare(`
       SELECT e.id, ee.embedding
       FROM errors e

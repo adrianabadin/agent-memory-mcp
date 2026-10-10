@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MCP (Model Context Protocol) server for a memory system backed by SQLite (WAL mode) with hybrid FTS5 BM25 + cosine vector search. Exposes 8 tools (store, store_batch, search, recall, find_related, list_recent, update, stats) over stdio transport. Uses Xenova/bge-m3 embeddings (1024 dimensions) via Hugging Face transformers.
+MCP (Model Context Protocol) server for a memory system backed by SQLite (WAL mode) with hybrid FTS5 BM25 + cosine vector search. Exposes 9 tools (store, store_batch, search, recall, find_related, list_recent, update, stats, get_memory_protocol) over stdio transport. Uses Xenova/bge-m3 embeddings (1024 dimensions) via Hugging Face transformers.
 
 ## Commands
 

@@ -1,8 +1,13 @@
 import { z } from 'zod';
+import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
   MEMORY_CATEGORIES,
+  VALID_RELATIONS,
   type MemoryStore,
+  type RelationType,
   type SearchMode,
   type SearchResult,
   type StoreRequest,
@@ -89,6 +94,7 @@ export function handleSearch(store: MemoryStore) {
     before?: string;
     limit?: number;
     explain?: boolean;
+    all_projects?: boolean;
   }): Promise<ReturnType<typeof success>> => {
     try {
       const mode = (args.mode ?? 'hybrid') as SearchMode;
@@ -99,6 +105,7 @@ export function handleSearch(store: MemoryStore) {
         before: args.before,
         limit: args.limit,
         explain: args.explain,
+        all_projects: args.all_projects,
       };
 
       if (args.explain && 'searchWithSummary' in store) {
@@ -360,6 +367,77 @@ export function handleResolveTopic(store: MemoryStore) {
       return success(memory);
     } catch (err) {
       return error(`resolve_topic failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handlePin(store: MemoryStore) {
+  return async (args: { id: string }): Promise<ReturnType<typeof success>> => {
+    try {
+      const memory = await store.pin(args.id);
+      return success(memory);
+    } catch (err) {
+      return error(`pin failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleUnpin(store: MemoryStore) {
+  return async (args: { id: string }): Promise<ReturnType<typeof success>> => {
+    try {
+      const memory = await store.unpin(args.id);
+      return success(memory);
+    } catch (err) {
+      return error(`unpin failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleCompare(store: MemoryStore) {
+  return async (args: { memory_id_a: string; memory_id_b: string }): Promise<ReturnType<typeof success>> => {
+    try {
+      const result = await store.compare(args.memory_id_a, args.memory_id_b);
+      return success(result);
+    } catch (err) {
+      return error(`compare failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleJudge(store: MemoryStore) {
+  return async (args: {
+    judgment_id: string;
+    relation: string;
+    reasoning?: string;
+    confidence?: number;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const result = await store.judge(
+        args.judgment_id,
+        args.relation as RelationType,
+        args.reasoning,
+        args.confidence,
+      );
+      return success(result);
+    } catch (err) {
+      return error(`judge failed: ${String(err)}`);
+    }
+  };
+}
+
+export function handleReviewQueue(store: MemoryStore) {
+  return async (args: {
+    project_id?: string;
+    limit?: number;
+  }): Promise<ReturnType<typeof success>> => {
+    try {
+      const result = await store.listReviewQueue({
+        projectId: args.project_id,
+        limit: args.limit,
+      });
+      return success(result);
+    } catch (err) {
+      return error(`review_queue failed: ${String(err)}`);
     }
   };
 }
@@ -662,6 +740,112 @@ export function handleEnrichSymbols(store: MemoryStore, enrichmentResolver?: (sy
   };
 }
 
+// ── Memory protocol flag reader ────────────────────────────────────
+//
+// Exposes the dual-save protocol flag stored by PMC at
+// `.planning/project-memory-context/memory-protocol.json`. Agents read this
+// to decide whether to mirror saves to Engram (version "dual") or fire PMC
+// only (version "pmc-only"). The flag file's authoritative key is
+// `memory_protocol_version`.
+//
+// Project root is derived from MEMORY_DB_PATH:
+//   /proj/.planning/project-memory-context/memory.db  ->  /proj
+// i.e. dirname(MEMORY_DB_PATH) then up two levels.
+//
+// This handler NEVER throws. Any read error, missing file, or invalid value
+// degrades to the safe default { version: 'dual', source: 'default' } so a
+// detection failure can never crash a session. When the file exists but holds
+// an invalid value, a `warning` is included alongside the default.
+
+const PROTOCOL_VALID_VERSIONS = new Set(['dual', 'pmc-only']);
+
+export interface MemoryProtocolResult {
+  version: 'dual' | 'pmc-only';
+  source: 'flag' | 'default';
+  pmcAvailable: boolean;
+  pmcDbPath: string;
+  flagPath: string;
+  warning?: string;
+}
+
+export interface MemoryProtocolDeps {
+  readFile?: typeof readFile;
+  existsSync?: typeof existsSync;
+  env?: NodeJS.ProcessEnv;
+}
+
+export function handleGetMemoryProtocol(deps: MemoryProtocolDeps = {}) {
+  const readFileImpl = deps.readFile ?? readFile;
+  const existsSyncImpl = deps.existsSync ?? existsSync;
+  const env = deps.env ?? process.env;
+
+  return async (): Promise<ReturnType<typeof success>> => {
+    const dbPath = env.MEMORY_DB_PATH ?? '';
+    // dirname(MEMORY_DB_PATH) -> .../project-memory-context
+    // up two levels            -> project root
+    const projectRoot = dbPath
+      ? path.resolve(path.dirname(dbPath), '..', '..')
+      : process.cwd();
+    const flagPath = path.join(
+      projectRoot,
+      '.planning',
+      'project-memory-context',
+      'memory-protocol.json',
+    );
+
+    let pmcAvailable = false;
+    try {
+      pmcAvailable = Boolean(dbPath) && existsSyncImpl(dbPath);
+    } catch {
+      pmcAvailable = false;
+    }
+
+    const base = {
+      pmcAvailable,
+      pmcDbPath: dbPath,
+      flagPath,
+    };
+
+    try {
+      const raw = await readFileImpl(flagPath, 'utf8');
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return success({
+          version: 'dual' as const,
+          source: 'default' as const,
+          ...base,
+          warning: 'Invalid flag file (not valid JSON), falling back to dual',
+        });
+      }
+
+      const value = (parsed as { memory_protocol_version?: unknown })?.memory_protocol_version;
+      if (typeof value === 'string' && PROTOCOL_VALID_VERSIONS.has(value)) {
+        return success({
+          version: value as 'dual' | 'pmc-only',
+          source: 'flag' as const,
+          ...base,
+        });
+      }
+
+      return success({
+        version: 'dual' as const,
+        source: 'default' as const,
+        ...base,
+        warning: `Invalid flag value "${String(value)}", falling back to dual`,
+      });
+    } catch {
+      // File missing or unreadable — safe default for cross-project use.
+      return success({
+        version: 'dual' as const,
+        source: 'default' as const,
+        ...base,
+      });
+    }
+  };
+}
+
 // ── Topic key suggestion (deterministic; queued version in PR-5) ───
 
 /**
@@ -741,6 +925,7 @@ export function registerTools(server: McpServer, store: MemoryStore, globalStore
       query: z.string().describe('What to search for — a concept, phrase, or question'),
       mode: modeSchema,
       ...filtersSchema,
+      all_projects: z.boolean().optional().default(false).describe('When true, search across all project memory databases'),
       explain: z.boolean().optional().describe('Debugging aid; adds per-stage scores (keyword rank/bm25, semantic rank/cosine, RRF score, decay factor) to each result. Hybrid mode only; ignored otherwise.'),
     },
     handleSearch(store),
@@ -851,6 +1036,60 @@ export function registerTools(server: McpServer, store: MemoryStore, globalStore
   );
 
   server.tool(
+    'pin',
+    'Pin a local observation so it appears before recent observations in memory context. Pinned state is local to this device and is not synced.',
+    {
+      id: z.string().describe('Observation ID to pin'),
+    },
+    handlePin(store),
+  );
+
+  server.tool(
+    'unpin',
+    'Unpin a local observation so it only appears in normal recency order. Pinned state is local to this device and is not synced.',
+    {
+      id: z.string().describe('Observation ID to unpin'),
+    },
+    handleUnpin(store),
+  );
+
+  // ── Conflict resolution tools (v9) ──
+
+  server.tool(
+    'compare',
+    'Compare two memories semantically. Returns similarity score, shared entities, content diff, and a recommended relation type.',
+    {
+      memory_id_a: z.string().describe('First memory ID'),
+      memory_id_b: z.string().describe('Second memory ID'),
+    },
+    handleCompare(store),
+  );
+
+  const relationEnum = z.enum(VALID_RELATIONS as unknown as [string, ...string[]]);
+
+  server.tool(
+    'judge',
+    'Record a verdict on a pending memory conflict surfaced by store with detect_conflicts. Persists a relation between two memories. For supersedes, the older memory is archived.',
+    {
+      judgment_id: z.string().describe('Structured ID from a candidate (e.g., "newId:existingId")'),
+      relation: relationEnum.describe('Verdict: related | compatible | scoped | conflicts_with | supersedes | not_conflict'),
+      reasoning: z.string().optional().describe('Explanation of the verdict'),
+      confidence: z.number().min(0).max(1).optional().describe('Confidence score 0.0..1.0'),
+    },
+    handleJudge(store),
+  );
+
+  server.tool(
+    'review_queue',
+    'List memories pending review (status=needs_review), ordered by oldest review request first. Returns { count, items }. Use to inspect decay-flagged or manually-flagged memories before archiving or reviving.',
+    {
+      project_id: z.string().optional().describe('Filter by project (reserved for multi-project search)'),
+      limit: z.number().optional().default(50).describe('Max results to return (default 50)'),
+    },
+    handleReviewQueue(store),
+  );
+
+  server.tool(
     'suggest_topic_key',
     'Suggest a deterministic topic key derived from content, deduplicated against existing keys.',
     {
@@ -878,6 +1117,15 @@ export function registerTools(server: McpServer, store: MemoryStore, globalStore
     'Get the currently active session context. Returns null if no session is active.',
     {},
     handleGetSessionContext(store),
+  );
+
+  // ── Memory protocol flag ──
+
+  server.tool(
+    'get_memory_protocol',
+    'Read the dual-save memory protocol flag (dual|pmc-only). Defaults to "dual" when no flag file exists. Used by agents to decide whether to mirror saves to Engram in addition to PMC.',
+    {},
+    handleGetMemoryProtocol(),
   );
 
   // ── Session ledger tools ──
