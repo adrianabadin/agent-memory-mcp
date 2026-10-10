@@ -1,6 +1,8 @@
 import { mkdir, writeFile, rename, unlink } from 'fs/promises';
 import { join } from 'path';
 import type {
+  CompareResult,
+  JudgeResult,
   Memory,
   MemoryCategory,
   MemoryStatus,
@@ -8,6 +10,7 @@ import type {
   MemoryStats,
   PruneOptions,
   PruneResult,
+  RelationType,
   SearchFilters,
   SearchMode,
   SearchResult,
@@ -20,6 +23,7 @@ import type {
   SessionSummary,
   SessionToolCall,
   StoreRequest,
+  StoreResult,
   UpdateRequest,
 } from './types.js';
 
@@ -46,10 +50,19 @@ export class HardcopyMemoryStore implements MemoryStore {
 
   // ── Mutations (mirrored to disk) ────────────────────────────
 
-  async store(request: StoreRequest): Promise<Memory> {
-    const memory = await this.inner.store(request);
-    await this.writeHardcopy(memory);
-    return memory;
+  async store(request: StoreRequest): Promise<Memory | StoreResult> {
+    const result = await this.inner.store(request);
+    // Extract Memory for hardcopy — StoreResult wraps it in .stored.
+    // When detect_conflicts=true and candidates exist, stored is absent (W2 fix).
+    const isStoreResult = (r: Memory | StoreResult): r is StoreResult =>
+      'judgment_required' in r;
+    const memory: Memory | undefined = isStoreResult(result)
+      ? result.stored
+      : result;
+    if (memory) {
+      await this.writeHardcopy(memory);
+    }
+    return result;
   }
 
   async storeBatch(requests: StoreRequest[]): Promise<Memory[]> {
@@ -180,6 +193,36 @@ export class HardcopyMemoryStore implements MemoryStore {
 
   async getBySymbol(symbolKey: string, opts?: { sources?: string[]; limit?: number }): Promise<import('./types.js').SymbolLinkedResult[]> {
     return this.inner.getBySymbol(symbolKey, opts);
+  }
+
+  // ── Pin/unpin (v8) — pass through ──────────────────────────────
+
+  async pin(id: string): Promise<Memory> {
+    const memory = await this.inner.pin(id);
+    await this.writeHardcopy(memory);
+    return memory;
+  }
+
+  async unpin(id: string): Promise<Memory> {
+    const memory = await this.inner.unpin(id);
+    await this.writeHardcopy(memory);
+    return memory;
+  }
+
+  // ── Conflict resolution (v9) — pass through ──────────────────────
+
+  async compare(idA: string, idB: string): Promise<CompareResult> {
+    return this.inner.compare(idA, idB);
+  }
+
+  async judge(judgmentId: string, relation: RelationType, reasoning?: string, confidence?: number): Promise<JudgeResult> {
+    return this.inner.judge(judgmentId, relation, reasoning, confidence);
+  }
+
+  // ── Review queue (v9 T-008) — pass through (no hardcopy for ephemeral queue) ──
+
+  async listReviewQueue(opts?: { projectId?: string; limit?: number }): Promise<{ count: number; items: Memory[] }> {
+    return this.inner.listReviewQueue(opts);
   }
 
   // ── Private ─────────────────────────────────────────────────

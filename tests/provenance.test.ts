@@ -74,9 +74,9 @@ describe('provenance', () => {
     const userVersionRow = migrated.prepare(`PRAGMA user_version`).get() as { user_version: number };
     // v0 → v1 (provenance) → v2 (lifecycle/session ledger) → v3 (session decay)
     // → v4 (gradual forgetting) → v5 (global promotion) → v6 (revive enrichment)
-    // → v7 (symbol-linked memory context); migrations run automatically and bump
-    // the target version.
-    expect(userVersionRow.user_version).toBe(7);
+    // → v7 (symbol-linked memory context) → v8 (pin/unpin); migrations run
+    // automatically and bump the target version.
+    expect(userVersionRow.user_version).toBe(9);
     const row = migrated.prepare(`SELECT id, content, origin, source_tool, session_id, content_hash FROM memories WHERE id = ?`).get('legacy-1') as Record<string, unknown>;
     expect(row.content).toBe('Legacy row');
     expect(row.origin).toBe('unknown');

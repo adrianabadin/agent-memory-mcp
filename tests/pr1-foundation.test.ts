@@ -49,9 +49,9 @@ describe('T-001: migration v2 and status schema', () => {
     await rm(tmpDir, { recursive: true, force: true });
   });
 
-  it('bumps user_version to 7 after initialize', () => {
+  it('bumps user_version to 8 after initialize (v7 → v8 pin migration)', () => {
     const db = new DatabaseSync(dbPath);
-    expect(userVersion(db)).toBe(7);
+    expect(userVersion(db)).toBe(9);
     db.close();
   });
 
@@ -107,10 +107,10 @@ describe('T-001: migration v2 and status schema', () => {
     });
   }
 
-  it('re-initialization is idempotent (user_version stays 7, no error)', async () => {
+  it('re-initialization is idempotent (user_version stays 8, no error)', async () => {
     await expect(store.initialize()).resolves.toBeUndefined();
     const db = new DatabaseSync(dbPath);
-    expect(userVersion(db)).toBe(7);
+    expect(userVersion(db)).toBe(9);
     db.close();
   });
 
@@ -169,7 +169,7 @@ describe('T-001: migration v2 and status schema', () => {
 
     // Inspect after the store handle is released (Windows-friendly).
     const check = new DatabaseSync(v1Path);
-    expect(userVersion(check)).toBe(7);
+    expect(userVersion(check)).toBe(9);
     const cols = tableColumns(check, 'memories');
     expect(cols).toEqual(expect.arrayContaining(['status', 'review_reason', 'reviewed_at']));
     expect(tableColumns(check, 'session_prompts').length).toBeGreaterThan(0);

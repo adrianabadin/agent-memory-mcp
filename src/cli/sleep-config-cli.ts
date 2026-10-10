@@ -2,7 +2,6 @@
 //
 // CLI entry point for sleep-config. Handles show/validate/set actions
 // for the global sleep-mode configuration.
-import { resolve } from 'node:path';
 import {
   loadSleepConfig,
   saveSleepConfig,
@@ -52,10 +51,10 @@ async function main() {
       }
 
       const config = await loadSleepConfig(configPath);
-      const sleepConfig: Record<string, unknown> = { ...config.sleep };
+      const sleepConfig: Record<string, unknown> = { ...(config.sleep as unknown as Record<string, unknown>) };
 
       // Parse value to correct type
-      const defaultVal = (DEFAULT_SLEEP_CONFIG as Record<string, unknown>)[key];
+      const defaultVal = (DEFAULT_SLEEP_CONFIG as unknown as Record<string, unknown>)[key];
       let parsed: unknown;
       if (typeof defaultVal === 'boolean') {
         parsed = value === 'true';
@@ -82,7 +81,7 @@ async function main() {
       }
 
       const fullConfig: FullSleepConfig = {
-        sleep: sleepConfig as SleepConfig,
+        sleep: sleepConfig as unknown as SleepConfig,
         forgetting: config.forgetting,
       };
       await saveSleepConfig(fullConfig, configPath);

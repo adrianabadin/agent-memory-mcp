@@ -46,6 +46,8 @@ export interface Memory {
   reviewedAt?: string;
   /** v7: soft symbol link (lang|path|kind|scope|name|arity). Survives graph rebuilds. */
   symbolKey?: string;
+  /** v8: pinned memories are exempt from decay. */
+  isPinned?: boolean;
 }
 
 export interface ExplainPayload {
@@ -327,6 +329,63 @@ export interface MergeResult {
 
 // ── Request shapes ─────────────────────────────────────────────────
 
+// ── Conflict resolution (v9) ─────────────────────────────────────────
+
+/** Valid relation types for memory_relations table. */
+export const VALID_RELATIONS = [
+  'related',
+  'compatible',
+  'scoped',
+  'conflicts_with',
+  'supersedes',
+  'not_conflict',
+] as const;
+
+export type RelationType = (typeof VALID_RELATIONS)[number];
+
+/** A candidate memory returned by detectCollisions. */
+export interface CandidateMemory {
+  id: string;
+  similarity: number;
+  content_preview: string;
+  createdAt: string;
+}
+
+/** A persisted relation between two memories. */
+export interface MemoryRelation {
+  id: string;
+  memoryIdA: string;
+  memoryIdB: string;
+  relation: RelationType;
+  confidence?: number;
+  reasoning?: string;
+  markedBy?: string;
+  createdAt: string;
+}
+
+/** Result of store() when detect_conflicts is enabled. */
+export interface StoreResult {
+  /** Present only when no collision candidates were found (memory was persisted). */
+  stored?: Memory;
+  judgment_required: boolean;
+  candidates?: CandidateMemory[];
+}
+
+/** Result of compare() — semantic comparison between two memories. */
+export interface CompareResult {
+  similarity: number;
+  sharedEntities: string[];
+  contentDiff: string;
+  recommendation: string;
+}
+
+/** Result of judge() — persists a relation and optionally cascades. */
+export interface JudgeResult {
+  persisted: true;
+  relation: RelationType;
+  cascaded?: 'archived';
+}
+
 export interface StoreRequest {
   content: string;
   category: MemoryCategory;
@@ -335,6 +394,10 @@ export interface StoreRequest {
   id?: string;         // explicit ID for upsert
   status?: MemoryStatus;
   topicKey?: string;   // auto-create alias after store
+  /** Opt-in: when true, run collision detection before storing. */
+  detect_conflicts?: boolean;
+  /** Cosine similarity threshold for collision detection (default 0.92). */
+  conflict_threshold?: number;
 }
 
 export interface UpdateRequest {
@@ -353,6 +416,8 @@ export interface SearchFilters {
   limit?: number;
   explain?: boolean;
   status?: MemoryStatus | 'all';  // 'all' = no filter; default excludes 'archived'
+  /** When true, search across all project memory databases (default false). */
+  all_projects?: boolean;
 }
 
 export type SearchMode = 'hybrid' | 'keyword' | 'semantic';
@@ -361,14 +426,51 @@ export type SearchMode = 'hybrid' | 'keyword' | 'semantic';
 
 export interface Embedder {
   initialize(): Promise<void>;
-  embed(text: string): Promise<number[]>;
-  embedBatch(texts: string[]): Promise<number[][]>;
+  /**
+   * Embed text. `role` only affects role-aware models (E5 prefixes);
+   * it defaults to 'passage' (stored-content semantics).
+   */
+  embed(text: string, role?: EmbeddingRole): Promise<number[]>;
+  embedBatch(texts: string[], role?: EmbeddingRole): Promise<number[][]>;
   dimensions(): number;
+  /**
+   * Optional stable identity for the DB open-time guard and cache identity.
+   * Identityless custom embedders (e.g. test mocks) keep legacy compatibility;
+   * their dimensions are still validated against stored metadata.
+   */
+  identity?(): EmbeddingIdentity | undefined;
+}
+
+/** Role qualifier for role-aware embedding models (e.g. E5 query:/passage:). */
+export type EmbeddingRole = 'query' | 'passage';
+
+/** Token-aware chunking policy; its `version` is part of embedding identity. */
+export interface ChunkPolicyIdentity {
+  version: string;
+  maxTokens: number;
+  overlapTokens: number;
+}
+
+/**
+ * Stable, serializable identity of an embedding configuration. Used for:
+ *   - DB open-time guard (reject mismatched model/policy/dimensions BEFORE
+ *     any schema mutation);
+ *   - embedding-cache identity (model/role/pooling/chunk policy);
+ *   - M2 re-vectorization handoff (stamped into `embedding_meta`).
+ */
+export interface EmbeddingIdentity {
+  model: string;
+  dimensions: number;
+  pooling: string;
+  normalize: boolean;
+  roleAware: boolean;
+  /** null = single-pass embedding (no chunking), e.g. the BGE default. */
+  chunkPolicy: ChunkPolicyIdentity | null;
 }
 
 export interface MemoryStore {
   initialize(): Promise<void>;
-  store(request: StoreRequest): Promise<Memory>;
+  store(request: StoreRequest): Promise<Memory | StoreResult>;
   storeBatch(requests: StoreRequest[]): Promise<Memory[]>;
   search(query: string, mode: SearchMode, filters: SearchFilters): Promise<SearchResult[]>;
   findRelated(memoryId: string, limit: number): Promise<SearchResult[]>;
@@ -424,6 +526,22 @@ export interface MemoryStore {
   attachSymbol(opts: { symbolKey: string; memoryId?: string; sessionItemId?: string }): Promise<{ id: string; symbolKey: string }>;
   /** Return all memories and session items linked to a symbol key. */
   getBySymbol(symbolKey: string, opts?: { sources?: string[]; limit?: number }): Promise<SymbolLinkedResult[]>;
+
+  // ── Pin/unpin (v8) ────────────────────────────────────────────────
+  /** Pin a memory (exempt from decay). Idempotent. Throws MemoryNotFoundError if id does not exist. */
+  pin(id: string): Promise<Memory>;
+  /** Unpin a memory (eligible for decay again). Idempotent. Throws MemoryNotFoundError if id does not exist. */
+  unpin(id: string): Promise<Memory>;
+
+  // ── Conflict resolution (v9) ──────────────────────────────────────
+  /** Compare two memories semantically. Returns similarity, shared entities, diff, and recommendation. */
+  compare(idA: string, idB: string): Promise<CompareResult>;
+  /** Judge a candidate pair: persist a relation, optionally cascade (supersedes → archive). */
+  judge(judgmentId: string, relation: RelationType, reasoning?: string, confidence?: number): Promise<JudgeResult>;
+
+  // ── Review queue (v9) ────────────────────────────────────────────
+  /** List memories with status='needs_review', ordered by reviewed_at ASC. */
+  listReviewQueue(opts?: { projectId?: string; limit?: number }): Promise<{ count: number; items: Memory[] }>;
 }
 
 /** Result of looking up records by symbol key. */

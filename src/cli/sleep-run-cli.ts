@@ -5,9 +5,8 @@
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { SqliteMemoryStore } from '../sqlite-store.js';
-import { MockEmbedder } from '../../tests/mocks.js';
+import { createProjectEmbedder } from '../embedder.js';
 import { executeSleepRun, loadCheckpoint, validateReport, type SleepRunConfig } from '../sleep-run.js';
 import { loadSleepConfig } from '../sleep-config.js';
 
@@ -65,8 +64,10 @@ async function main() {
   // Load sleep config for forgetting config
   const sleepConfig = await loadSleepConfig(configPath);
 
-  // Initialize SQLite store
-  const embedder = new MockEmbedder();
+  // Initialize SQLite store with the PROJECT embedding policy (env-driven —
+  // E5 prefixes + full-text chunking when the project is configured for E5).
+  const embedder = createProjectEmbedder();
+  await embedder.initialize();
   const store = new SqliteMemoryStore(dbPath, embedder);
   await store.initialize();
   const db = store.getDb();

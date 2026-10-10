@@ -1,12 +1,18 @@
 import type {
+  CompareResult,
   Embedder,
+  EmbeddingIdentity,
+  EmbeddingRole,
+  JudgeResult,
   Memory,
   MemoryCategory,
+  MemoryRelation,
   MemoryStatus,
   MemoryStore,
   MemoryStats,
   PruneOptions,
   PruneResult,
+  RelationType,
   SearchFilters,
   SearchMode,
   SearchResult,
@@ -20,29 +26,41 @@ import type {
   SessionSummary,
   SessionToolCall,
   StoreRequest,
+  StoreResult,
   SymbolLinkedResult,
   UpdateRequest,
 } from '../src/types.js';
+import { VALID_RELATIONS } from '../src/types.js';
 
 // ── MockEmbedder ───────────────────────────────────────────────────
 // Returns deterministic pseudo-vectors for testing. No model, no I/O.
 
 export class MockEmbedder implements Embedder {
   readonly callLog: string[] = [];
+  /** Role-qualified view of embed() calls (M1: query vs passage). */
+  readonly roleLog: Array<{ text: string; role?: EmbeddingRole }> = [];
+
+  constructor(private readonly identityValue?: EmbeddingIdentity) {}
 
   async initialize(): Promise<void> {}
 
-  async embed(text: string): Promise<number[]> {
+  async embed(text: string, role?: EmbeddingRole): Promise<number[]> {
     this.callLog.push(text);
+    this.roleLog.push({ text, role });
     return this.deterministicVector(text);
   }
 
-  async embedBatch(texts: string[]): Promise<number[][]> {
-    return Promise.all(texts.map(t => this.embed(t)));
+  async embedBatch(texts: string[], role?: EmbeddingRole): Promise<number[][]> {
+    return Promise.all(texts.map(t => this.embed(t, role)));
   }
 
   dimensions(): number {
     return 384;
+  }
+
+  /** Optional identity; identityless by default (custom-embedder test compat). */
+  identity(): EmbeddingIdentity | undefined {
+    return this.identityValue;
   }
 
   private deterministicVector(text: string): number[] {
@@ -94,6 +112,7 @@ export class MockMemoryStore implements MemoryStore {
   protected toolCallsById = new Map<string, SessionToolCall>();
   protected summariesById = new Map<string, SessionSummary>();
   protected linkRows: SessionLink[] = [];
+  protected relationRows: MemoryRelation[] = [];
 
   // Insertion order for stable iteration / listRecent ordering.
   protected memoryOrder: string[] = [];
@@ -146,7 +165,7 @@ export class MockMemoryStore implements MemoryStore {
 
   // ── Entity stores (legacy surface) ──
 
-  async store(request: StoreRequest): Promise<Memory> {
+  async store(request: StoreRequest): Promise<Memory | StoreResult> {
     const id = request.id ?? this.nextId('mem');
     const existing = this.memoriesById.get(id);
 
@@ -184,6 +203,38 @@ export class MockMemoryStore implements MemoryStore {
       ...(existing?.reviewedAt ? { reviewedAt: existing.reviewedAt } : {}),
     };
 
+    // Detect conflicts (opt-in) — simple substring match for mock.
+    // W2 fix: detect BEFORE upsert. When candidates exist, DON'T store.
+    if (request.detect_conflicts) {
+      const threshold = request.conflict_threshold ?? 0.92;
+      const candidates = this.memories
+        .filter(m => m.id !== id)
+        .filter(m => {
+          const a = m.content.toLowerCase();
+          const b = request.content.toLowerCase();
+          // Simple token overlap for mock (real impl uses cosine)
+          const tokensA = new Set(a.split(/\s+/).filter(t => t.length > 2));
+          const tokensB = new Set(b.split(/\s+/).filter(t => t.length > 2));
+          if (tokensA.size === 0 || tokensB.size === 0) return false;
+          let overlap = 0;
+          for (const t of tokensB) {
+            if (tokensA.has(t)) overlap++;
+          }
+          return (overlap / tokensB.size) >= 0.6;
+        })
+        .map(m => ({
+          id: m.id,
+          similarity: 0.95, // mock always returns high similarity for token matches
+          content_preview: m.content.slice(0, 200),
+          createdAt: m.createdAt,
+        }));
+
+      if (candidates.length > 0) {
+        return { judgment_required: true, candidates };
+      }
+    }
+
+    // No conflict (or detect_conflicts not requested) — safe to store
     this.memoriesById.set(id, memory);
     if (!existing) {
       this.memoryOrder.push(id);
@@ -193,11 +244,25 @@ export class MockMemoryStore implements MemoryStore {
       this.topicAliasMap.set(request.topicKey, id);
     }
 
+    if (request.detect_conflicts) {
+      return { stored: memory, judgment_required: false };
+    }
+
     return memory;
   }
 
   async storeBatch(requests: StoreRequest[]): Promise<Memory[]> {
-    return Promise.all(requests.map(r => this.store(r)));
+    const results: Memory[] = [];
+    for (const r of requests) {
+      const result = await this.store(r);
+      // store() may return Memory or StoreResult; extract Memory in both cases.
+      // When detect_conflicts=true and candidates exist, stored is absent (W2 fix).
+      const memory = 'stored' in result ? result.stored : result;
+      if (memory) {
+        results.push(memory);
+      }
+    }
+    return results;
   }
 
   async search(
@@ -210,6 +275,13 @@ export class MockMemoryStore implements MemoryStore {
       m.content.toLowerCase().includes(q),
     );
     results = this.applyFilters(results, filters);
+    // Pinned memories sort first
+    results.sort((a, b) => {
+      const aPinned = a.isPinned ? 1 : 0;
+      const bPinned = b.isPinned ? 1 : 0;
+      if (aPinned !== bPinned) return bPinned - aPinned;
+      return 0;
+    });
     const limit = filters.limit ?? 10;
     return results.slice(0, limit).map(m => ({ memory: m, score: 0.9 }));
   }
@@ -613,6 +685,24 @@ export class MockMemoryStore implements MemoryStore {
     throw new Error('Either memory_id or session_item_id must be provided');
   }
 
+  // ── Pin/unpin (v8) ─────────────────────────────────────────────
+
+  async pin(id: string): Promise<Memory> {
+    const existing = this.memoriesById.get(id);
+    if (!existing) throw new Error(`Memory ${id} not found`);
+    const updated: Memory = { ...existing, isPinned: true, updatedAt: new Date().toISOString() };
+    this.memoriesById.set(id, updated);
+    return updated;
+  }
+
+  async unpin(id: string): Promise<Memory> {
+    const existing = this.memoriesById.get(id);
+    if (!existing) throw new Error(`Memory ${id} not found`);
+    const updated: Memory = { ...existing, isPinned: false, updatedAt: new Date().toISOString() };
+    this.memoriesById.set(id, updated);
+    return updated;
+  }
+
   async getBySymbol(symbolKey: string, opts?: { sources?: string[]; limit?: number }): Promise<SymbolLinkedResult[]> {
     const sources = opts?.sources ?? ['memory', 'session_summary'];
     const limit = opts?.limit ?? 50;
@@ -703,5 +793,142 @@ export class MockMemoryStore implements MemoryStore {
       results = results.filter(m => m.createdAt <= filters.before!);
     }
     return results;
+  }
+
+  // ── Memory relations (v9) ──────────────────────────────────────
+
+  addMemoryRelation(opts: {
+    memoryIdA: string;
+    memoryIdB: string;
+    relation: RelationType;
+    confidence?: number;
+    reasoning?: string;
+    markedBy?: string;
+  }): MemoryRelation {
+    if (!(VALID_RELATIONS as readonly string[]).includes(opts.relation)) {
+      throw new Error(
+        `Invalid relation '${opts.relation}': must be one of ${VALID_RELATIONS.join(', ')}`,
+      );
+    }
+
+    const rel: MemoryRelation = {
+      id: this.nextId('rel'),
+      memoryIdA: opts.memoryIdA,
+      memoryIdB: opts.memoryIdB,
+      relation: opts.relation,
+      createdAt: new Date().toISOString(),
+      ...(opts.confidence !== undefined ? { confidence: opts.confidence } : {}),
+      ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
+      ...(opts.markedBy !== undefined ? { markedBy: opts.markedBy } : {}),
+    };
+
+    this.relationRows.push(rel);
+    return rel;
+  }
+
+  getMemoryRelation(memoryIdA: string, memoryIdB: string): MemoryRelation | null {
+    return this.relationRows.find(r => r.memoryIdA === memoryIdA && r.memoryIdB === memoryIdB) ?? null;
+  }
+
+  listMemoryRelations(memoryId: string): MemoryRelation[] {
+    return this.relationRows.filter(r => r.memoryIdA === memoryId || r.memoryIdB === memoryId);
+  }
+
+  // ── compare / judge (v9 T-006) ──────────────────────────────────
+
+  async compare(idA: string, idB: string): Promise<CompareResult> {
+    const memA = this.memoriesById.get(idA);
+    if (!memA) throw new Error(`Memory ${idA} not found`);
+    const memB = this.memoriesById.get(idB);
+    if (!memB) throw new Error(`Memory ${idB} not found`);
+
+    // Token-based similarity for mock
+    const tokensA = new Set(memA.content.toLowerCase().split(/\s+/).filter(t => t.length > 2));
+    const tokensB = new Set(memB.content.toLowerCase().split(/\s+/).filter(t => t.length > 2));
+    const allTokens = new Set([...tokensA, ...tokensB]);
+    let overlap = 0;
+    for (const t of tokensA) {
+      if (tokensB.has(t)) overlap++;
+    }
+    const similarity = allTokens.size > 0 ? overlap / allTokens.size : 0;
+
+    const sharedEntities: string[] = [];
+    for (const t of tokensA) {
+      if (tokensB.has(t) && t.length > 3) sharedEntities.push(t);
+    }
+
+    const lenA = memA.content.length;
+    const lenB = memB.content.length;
+    const contentDiff = lenA > lenB
+      ? `A is ${lenA - lenB} chars longer`
+      : lenB > lenA
+        ? `B is ${lenB - lenA} chars longer`
+        : 'Same length';
+
+    let recommendation: string;
+    if (similarity >= 0.95) {
+      recommendation = 'supersedes: near-duplicate content';
+    } else if (similarity >= 0.85) {
+      recommendation = 'conflicts_with: high similarity with differences';
+    } else if (similarity >= 0.5) {
+      recommendation = 'related: moderate semantic overlap';
+    } else {
+      recommendation = 'not_conflict: low similarity';
+    }
+
+    return { similarity, sharedEntities, contentDiff, recommendation };
+  }
+
+  async judge(judgmentId: string, relation: RelationType, reasoning?: string, confidence?: number): Promise<JudgeResult> {
+    const colonIdx = judgmentId.indexOf(':');
+    if (colonIdx <= 0 || colonIdx === judgmentId.length - 1) {
+      throw new Error(
+        `Invalid judgment_id '${judgmentId}': must be in format 'newId:existingId'`,
+      );
+    }
+
+    if (!(VALID_RELATIONS as readonly string[]).includes(relation)) {
+      throw new Error(
+        `Invalid relation '${relation}': must be one of ${VALID_RELATIONS.join(', ')}`,
+      );
+    }
+
+    const newId = judgmentId.slice(0, colonIdx);
+    const existingId = judgmentId.slice(colonIdx + 1);
+
+    if (!this.memoriesById.has(newId)) throw new Error(`Memory ${newId} not found`);
+    if (!this.memoriesById.has(existingId)) throw new Error(`Memory ${existingId} not found`);
+
+    this.addMemoryRelation({
+      memoryIdA: newId,
+      memoryIdB: existingId,
+      relation,
+      confidence,
+      reasoning,
+      markedBy: 'judge',
+    });
+
+    let cascaded: 'archived' | undefined;
+    if (relation === 'supersedes') {
+      await this.updateMemoryStatus(existingId, 'archived', `superseded by ${newId}`);
+      cascaded = 'archived';
+    }
+
+    return { persisted: true, relation, ...(cascaded ? { cascaded } : {}) };
+  }
+
+  // ── Review queue (v9 T-008) ─────────────────────────────────────
+
+  async listReviewQueue(opts?: { projectId?: string; limit?: number }): Promise<{ count: number; items: Memory[] }> {
+    const limit = opts?.limit ?? 50;
+    let items = this.memories.filter(m => m.status === 'needs_review');
+    // Sort by reviewedAt ASC, then createdAt ASC (oldest first)
+    items.sort((a, b) => {
+      const aTime = a.reviewedAt ?? a.createdAt;
+      const bTime = b.reviewedAt ?? b.createdAt;
+      return aTime.localeCompare(bTime);
+    });
+    items = items.slice(0, limit);
+    return { count: items.length, items };
   }
 }

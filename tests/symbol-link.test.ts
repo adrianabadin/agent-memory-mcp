@@ -68,9 +68,9 @@ describe('v7 migration: symbol_key and project_id columns', () => {
     await cleanup();
   });
 
-  it('bumps user_version to 7 after initialize', () => {
+  it('bumps user_version to 8 after initialize (v7 → v8 pin migration)', () => {
     const db = new DatabaseSync(dbPath);
-    expect(userVersion(db)).toBe(7);
+    expect(userVersion(db)).toBe(9);
     db.close();
   });
 
@@ -108,7 +108,7 @@ describe('v7 migration: symbol_key and project_id columns', () => {
   it('re-initialization is idempotent (user_version stays 7, no error)', async () => {
     await expect(store.initialize()).resolves.toBeUndefined();
     const db = new DatabaseSync(dbPath);
-    expect(userVersion(db)).toBe(7);
+    expect(userVersion(db)).toBe(9);
     db.close();
   });
 

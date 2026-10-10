@@ -1,16 +1,23 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import type {
+  CandidateMemory,
+  ChunkPolicyIdentity,
+  CompareResult,
   Embedder,
+  EmbeddingIdentity,
   ExplainSummary,
+  JudgeResult,
   Memory,
   MemoryCategory,
   MemoryOrigin,
+  MemoryRelation,
   MemoryStats,
   MemoryStatus,
   MemoryStore,
   PruneOptions,
   PruneResult,
+  RelationType,
   ResolvedSearchQuery,
   SearchFilters,
   SearchMode,
@@ -28,6 +35,7 @@ import type {
   SessionSummary,
   SessionToolCall,
   StoreRequest,
+  StoreResult,
   UnifiedSearchExplain,
   UnifiedSearchQuery,
   UnifiedSearchSource,
@@ -37,6 +45,7 @@ import {
   COMPACTED_SESSION_SOURCES,
   RAW_SESSION_SOURCES,
   SESSION_SEARCH_SOURCES,
+  VALID_RELATIONS,
 } from './types.js';
 import { ConcurrentUpdateError, MemoryNotFoundError } from './errors.js';
 import {
@@ -64,6 +73,157 @@ import {
   rrf,
   escapeFtsQuery,
 } from './shared/vector-utils.js';
+
+/**
+ * Ledger/session embedding write helper: an EMPTY vector means "pending" (no
+ * model available, e.g. the ledger-only capture-drain path) and is stored as
+ * NULL — never as an invalid zero-byte BLOB. Session embedding columns are
+ * nullable; readers treat NULL as pending (keyword-only scoring).
+ */
+export function embeddingToBlobOrNull(vector: number[]): Buffer | null {
+  return vector.length > 0 ? embeddingToBlob(vector) : null;
+}
+
+// ── Embedding identity guard (M1: E5 small migration) ──────────────
+
+/** Single-row key/value table stamped via {@link writeEmbeddingIdentity}. */
+export const EMBEDDING_META_TABLE = 'embedding_meta';
+
+/** Vector length of legacy (pre-identity) databases — the known BGE baseline. */
+export const LEGACY_EXPECTED_DIMENSIONS = 1024;
+
+/** Identity metadata persisted in an embedding_meta row. */
+export interface StoredEmbeddingIdentity {
+  model: string;
+  dimensions: number;
+  pooling: string;
+  normalize: boolean;
+  roleAware: boolean;
+  chunkPolicyVersion: string | null;
+  chunkPolicy: ChunkPolicyIdentity | null;
+  stampedAt: string;
+}
+
+/** Thrown when the configured embedder is incompatible with the DB identity. */
+export class EmbeddingIdentityMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EmbeddingIdentityMismatchError';
+  }
+}
+
+/**
+ * Read the stored embedding identity. READ-ONLY: never creates tables, so it
+ * is safe to call before any schema mutation (open-time guard).
+ */
+export function readEmbeddingIdentity(db: DatabaseSync): StoredEmbeddingIdentity | null {
+  const table = db.prepare(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`,
+  ).get(EMBEDDING_META_TABLE) as { name: string } | undefined;
+  if (!table) return null;
+  const row = db.prepare(`SELECT * FROM ${EMBEDDING_META_TABLE} WHERE id = 1`).get() as
+    | Record<string, unknown>
+    | undefined;
+  if (!row) return null;
+  let chunkPolicy: ChunkPolicyIdentity | null = null;
+  const policyJson = row['chunk_policy_json'];
+  if (typeof policyJson === 'string' && policyJson.length > 0) {
+    chunkPolicy = JSON.parse(policyJson) as ChunkPolicyIdentity;
+  }
+  return {
+    model: String(row['model']),
+    dimensions: Number(row['dimensions']),
+    pooling: String(row['pooling']),
+    normalize: Boolean(row['normalize']),
+    roleAware: Boolean(row['role_aware']),
+    chunkPolicyVersion: row['chunk_policy_version'] == null ? null : String(row['chunk_policy_version']),
+    chunkPolicy,
+    stampedAt: String(row['stamped_at']),
+  };
+}
+
+/**
+ * Stamp the embedding identity into the DB (upsert on id=1). Public API for
+ * migration tooling (M2): a re-vectorized sibling DB must be stamped BEFORE
+ * being opened with the new embedder, because the open-time guard rejects
+ * unlabelled databases for non-legacy (384-dim) embedders.
+ */
+export function writeEmbeddingIdentity(db: DatabaseSync, identity: EmbeddingIdentity): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ${EMBEDDING_META_TABLE} (
+      id                  INTEGER PRIMARY KEY CHECK (id = 1),
+      model               TEXT NOT NULL,
+      dimensions          INTEGER NOT NULL,
+      pooling             TEXT NOT NULL,
+      normalize           INTEGER NOT NULL,
+      role_aware          INTEGER NOT NULL,
+      chunk_policy_version TEXT,
+      chunk_policy_json   TEXT,
+      stamped_at          TEXT NOT NULL
+    );
+  `);
+  db.prepare(`
+    INSERT INTO ${EMBEDDING_META_TABLE}
+      (id, model, dimensions, pooling, normalize, role_aware, chunk_policy_version, chunk_policy_json, stamped_at)
+    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      model = excluded.model,
+      dimensions = excluded.dimensions,
+      pooling = excluded.pooling,
+      normalize = excluded.normalize,
+      role_aware = excluded.role_aware,
+      chunk_policy_version = excluded.chunk_policy_version,
+      chunk_policy_json = excluded.chunk_policy_json,
+      stamped_at = excluded.stamped_at
+  `).run(
+    identity.model,
+    identity.dimensions,
+    identity.pooling,
+    identity.normalize ? 1 : 0,
+    identity.roleAware ? 1 : 0,
+    identity.chunkPolicy?.version ?? null,
+    identity.chunkPolicy ? JSON.stringify(identity.chunkPolicy) : null,
+    new Date().toISOString(),
+  );
+}
+
+// ── Migration state guard (M2: E5 re-vectorization) ────────────
+
+/** Target-only migration metadata table written by the M2 `reembed` tooling. */
+export const MIGRATION_STATE_TABLE = 'embedding_migration_state';
+
+/** Thrown when a DB carries a non-COMPLETE M2 re-vectorization stamp. */
+export class MigrationStateIncompleteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MigrationStateIncompleteError';
+  }
+}
+
+/**
+ * Lightweight M2 guard on an OPEN handle: a DB that carries the migration
+ * state table must report status COMPLETE in its single row (id=1) —
+ * INCOMPLETE, ERROR, any unknown status, or a missing row when the table
+ * exists all throw. DBs without the table are not migration targets and
+ * pass. Called from `guardEmbeddingIdentity` BEFORE any schema/migration
+ * mutation, so an incomplete re-vectorization target can never be opened
+ * (or migrated) by the runtime.
+ */
+export function assertMigrationStateComplete(db: DatabaseSync): void {
+  const table = db
+    .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`)
+    .get(MIGRATION_STATE_TABLE) as { name: string } | undefined;
+  if (!table) return;
+  const row = db
+    .prepare(`SELECT status FROM ${MIGRATION_STATE_TABLE} WHERE id = 1`)
+    .get() as { status: string } | undefined;
+  if (!row || row.status !== 'COMPLETE') {
+    throw new MigrationStateIncompleteError(
+      `Embedding migration INCOMPLETE in this database (status=${row?.status ?? 'missing'}). ` +
+      `Finish the re-vectorization (reembed CLI --resume) before opening it with the runtime.`,
+    );
+  }
+}
 
 // ── Schema ─────────────────────────────────────────────────────────
 
@@ -139,6 +299,7 @@ interface MemoryRow {
   memory_state?: string;
   last_reinforced_at?: string | null;
   symbol_key?: string | null;
+  is_pinned?: number;
 }
 
 // ── Utilities ─────────────────────────────────────────────────────
@@ -176,6 +337,7 @@ function rowToMemory(row: MemoryRow): Memory {
   if (row.symbol_key) {
     memory.symbolKey = row.symbol_key;
   }
+  memory.isPinned = !!row.is_pinned;
   return memory;
 }
 
@@ -190,6 +352,51 @@ function isEvergreen(row: MemoryRow): boolean {
 
 const DECAY_HALF_LIFE_DAYS = parseDecayHalfLife(process.env.MEMORY_DECAY_HALF_LIFE);
 const MS_PER_DAY = 86_400_000;
+
+/** Decay states that trigger automatic needs_review flagging (T-008). */
+const REVIEWABLE_DECAY_STATES = new Set(['dimmed', 'shadow', 'gist_only']);
+
+/**
+ * Predicate: should a decay transition auto-flag the memory for review?
+ * True when the new state is dimmed/shadow/gist_only AND the transition
+ * actually changed state. Pinned and non_forgettable checks are handled
+ * upstream (query filter or early return).
+ */
+function shouldAutoFlagForReview(newState: string, fromState: string): boolean {
+  return REVIEWABLE_DECAY_STATES.has(newState) && newState !== fromState;
+}
+
+/** Common English stop words excluded from shared entity extraction. */
+const STOP_WORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+  'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
+  'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+  'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need',
+  'it', 'its', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she',
+  'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his',
+  'our', 'their', 'not', 'no', 'nor', 'as', 'if', 'then', 'than', 'too',
+  'very', 'just', 'about', 'above', 'after', 'again', 'all', 'also',
+  'any', 'because', 'before', 'between', 'both', 'each', 'few', 'more',
+  'most', 'other', 'some', 'such', 'into', 'over', 'own', 'same', 'so',
+]);
+
+/**
+ * Extract shared entities (significant tokens) between two content strings.
+ * Returns tokens > 3 chars, not stop words, found in both contents.
+ */
+function extractSharedEntities(contentA: string, contentB: string): string[] {
+  const tokensA = new Set(
+    contentA.toLowerCase().split(/[^a-z0-9_]+/).filter(t => t.length > 3 && !STOP_WORDS.has(t)),
+  );
+  const tokensB = new Set(
+    contentB.toLowerCase().split(/[^a-z0-9_]+/).filter(t => t.length > 3 && !STOP_WORDS.has(t)),
+  );
+  const shared: string[] = [];
+  for (const t of tokensA) {
+    if (tokensB.has(t)) shared.push(t);
+  }
+  return shared.slice(0, 10);
+}
 
 function applyDecay(row: MemoryRow, rawScore: number): number {
   if (DECAY_HALF_LIFE_DAYS <= 0 || isEvergreen(row)) return rawScore;
@@ -526,6 +733,8 @@ export class SqliteMemoryStore implements MemoryStore {
   private db!: DatabaseSync;
   // In-memory session context (not persisted; set by callers via MCP ENV).
   private sessionContext: { sessionId: string; projectId: string } | null = null;
+  // T-013: sibling stores for multi-DB cross-project search.
+  private siblingStores: SqliteMemoryStore[] = [];
 
   constructor(
     private readonly dbPath: string,
@@ -537,8 +746,169 @@ export class SqliteMemoryStore implements MemoryStore {
     // does not leak file locks (important on Windows WAL databases).
     this.close();
     this.db = new DatabaseSync(this.dbPath);
+    // Open-time embedding-identity guard: MUST run BEFORE any schema
+    // mutation (SCHEMA_SQL / migrations) so an incompatible embedder can
+    // never write vectors — or migrations — into a mismatched database.
+    try {
+      this.guardEmbeddingIdentity();
+    } catch (err) {
+      this.close(); // release the file lock (Windows) before propagating
+      throw err;
+    }
     this.db.exec(SCHEMA_SQL);
     this.runMigrations();
+  }
+
+  /**
+   * Reject opening a database whose stored embedding identity does not match
+   * the configured embedder, and stamp fresh databases on first open.
+   *
+   * Rules (M1 E5 small migration):
+   *   - stored identity present:
+   *       dimensions ALWAYS validated; model/pooling/chunk-policy-version
+   *       validated when the embedder exposes identity(). Identityless custom
+   *       embedders (test mocks) keep compat — only dims are checked.
+   *   - no stored identity + fresh DB (no schema yet): stamp the identity.
+   *   - no stored identity + legacy schema: known-compat for 1024-dim legacy
+   *     embedders (BGE); a non-legacy (e.g. E5 384) embedder must NOT pretend
+   *     to be the legacy model — throw and require an explicit stamp (M2).
+   */
+  private guardEmbeddingIdentity(): void {
+    // M2: reject an INCOMPLETE re-vectorization target BEFORE any schema or
+    // migration writes (initialize() runs this guard first).
+    assertMigrationStateComplete(this.db);
+    const stored = readEmbeddingIdentity(this.db);
+    const identity = this.embedder.identity?.() ?? null;
+    const dims = this.embedder.dimensions();
+    // Expected vector length for the histogram audit: prefer the DB stamp,
+    // then the embedder's identity, then its declared dimensions.
+    const expectedDims = stored?.dimensions ?? identity?.dimensions ?? dims;
+
+    if (stored) {
+      if (dims !== stored.dimensions) {
+        throw new EmbeddingIdentityMismatchError(
+          `Embedding identity mismatch: DB '${this.dbPath}' is stamped for ${stored.model} ` +
+          `(${stored.dimensions} dims) but the configured embedder reports ${dims} dims.`,
+        );
+      }
+      if (identity) {
+        if (identity.model !== stored.model) {
+          throw new EmbeddingIdentityMismatchError(
+            `Embedding identity mismatch: DB '${this.dbPath}' is stamped for model '${stored.model}' ` +
+            `but the configured embedder is '${identity.model}'.`,
+          );
+        }
+        if (identity.pooling !== stored.pooling) {
+          throw new EmbeddingIdentityMismatchError(
+            `Embedding identity mismatch: DB '${this.dbPath}' pooling '${stored.pooling}' ` +
+            `vs embedder pooling '${identity.pooling}'.`,
+          );
+        }
+        const identityPolicy = identity.chunkPolicy?.version ?? null;
+        if (identityPolicy !== stored.chunkPolicyVersion) {
+          throw new EmbeddingIdentityMismatchError(
+            `Embedding identity mismatch: DB '${this.dbPath}' chunk policy '${stored.chunkPolicyVersion ?? 'none'}' ` +
+            `vs embedder chunk policy '${identityPolicy ?? 'none'}'.`,
+          );
+        }
+      }
+      // The stamp does NOT override reality: audit the actual stored vectors.
+      // Stamped (migrated) DBs are STRICT: no legacy placeholder tolerance.
+      this.auditEmbeddingHistograms(expectedDims, true);
+      return;
+    }
+
+    // No stored identity.
+    const schemaPresent = this.tableExists('memories');
+    if (!schemaPresent) {
+      // Fresh database: safe to stamp the configured identity on first open.
+      if (identity) writeEmbeddingIdentity(this.db, identity);
+      return;
+    }
+    // Legacy (unlabelled) database with pre-existing schema: audit the actual
+    // stored vector lengths against the target embedder dims before opening.
+    // Unlabelled legacy DBs tolerate historical session placeholder junk
+    // (0-byte / non-float32) as pending — stamped/migrated DBs never do.
+    this.auditEmbeddingHistograms(expectedDims, false);
+    if (!identity) return; // identityless custom embedder — compat
+    if (identity.dimensions === LEGACY_EXPECTED_DIMENSIONS) return; // known legacy BGE compat
+    throw new EmbeddingIdentityMismatchError(
+      `Refusing to open unlabelled legacy DB '${this.dbPath}' with non-legacy embedder ` +
+      `${identity.model} (${identity.dimensions} dims). Known legacy databases carry ` +
+      `${LEGACY_EXPECTED_DIMENSIONS}-dim vectors; stamp the intended identity explicitly ` +
+      `(writeEmbeddingIdentity) before re-vectorizing.`,
+    );
+  }
+
+  /**
+   * Cheap open-time audit of ALL existing non-null embedding columns via SQL
+   * typeof/length counts (no corpus load, no vector math — finiteness/norms
+   * are validated during M2 migration, not at open):
+   *   - NULL                       → pending (allowed, e.g. ledger-only writes);
+   *   - non-BLOB non-NULL          → rejected;
+   *   - BLOB with length ≠ dims*4  → rejected (dim mismatch), even when the
+   *     stored metadata stamp agrees with the embedder.
+   *
+   * `strict=false` (UNLABELLED legacy DBs ONLY): historical session placeholder
+   * junk (zero-byte or not a multiple of 4, hence not a float32 vector) is
+   * tolerated as pending; new writes never produce it (embeddingToBlobOrNull
+   * emits only NULL or dims*4 blobs) and M2 normalizes those rows. Any
+   * E5-stamped/migrated DB (`strict=true`) rejects every non-NULL invalid or
+   * non-dims*4 blob, including 0-byte and 3-byte ones; NULL pending remains
+   * allowed everywhere.
+   */
+  private auditEmbeddingHistograms(expectedDims: number, strict: boolean): void {
+    const expectedBytes = expectedDims * 4;
+    const targets: Array<{ table: string; allowLegacyEmpty: boolean }> = [
+      { table: 'memory_embeddings', allowLegacyEmpty: false },
+      { table: 'session_prompts', allowLegacyEmpty: true },
+      { table: 'session_responses', allowLegacyEmpty: true },
+      { table: 'session_tool_calls', allowLegacyEmpty: true },
+      { table: 'session_summaries', allowLegacyEmpty: true },
+    ];
+    for (const t of targets) {
+      if (!this.tableExists(t.table)) continue;
+      const rows = this.db.prepare(
+        `SELECT typeof(embedding) AS etype, length(embedding) AS elen, COUNT(*) AS n
+         FROM ${t.table} GROUP BY etype, elen`,
+      ).all() as unknown as Array<{ etype: string; elen: number | null; n: number }>;
+      for (const r of rows) {
+        if (r.etype === 'null') continue; // pending vectors (ledger-only path)
+        if (r.etype !== 'blob') {
+          throw new EmbeddingIdentityMismatchError(
+            `Embedding audit failed: ${this.dbPath}.${t.table}.embedding has ${r.n} ` +
+            `non-blob value(s) (typeof=${r.etype}).`,
+          );
+        }
+        const bytes = r.elen ?? 0;
+        if (bytes % 4 !== 0 || bytes === 0) {
+          // Not a float32 vector of the expected length.
+          if (!strict && t.allowLegacyEmpty) continue; // unlabelled-legacy pending junk
+          if (!strict) {
+            throw new EmbeddingIdentityMismatchError(
+              `Embedding audit failed: ${this.dbPath}.${t.table}.embedding has ${r.n} corrupt blob(s) ` +
+              `(${bytes} bytes, not a multiple of 4 or zero-byte).`,
+            );
+          }
+          throw new EmbeddingIdentityMismatchError(
+            `Embedding audit failed: ${this.dbPath}.${t.table}.embedding has ${r.n} invalid blob(s) ` +
+            `(${bytes} bytes; stamped DBs require exactly ${expectedBytes} bytes, NULL = pending).`,
+          );
+        }
+        if (bytes !== expectedBytes) {
+          throw new EmbeddingIdentityMismatchError(
+            `Embedding audit failed: ${this.dbPath}.${t.table}.embedding has ${r.n} blob(s) of ` +
+            `${bytes} bytes, expected ${expectedBytes} (${expectedDims} dims × 4).`,
+          );
+        }
+      }
+    }
+  }
+
+  private tableExists(name: string): boolean {
+    return Boolean(
+      this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name),
+    );
   }
 
   /**
@@ -781,6 +1151,35 @@ export class SqliteMemoryStore implements MemoryStore {
 
       this.db.exec('PRAGMA user_version = 7');
     }
+
+    // ── v8: Pin support (is_pinned column + index) ──
+    if (current < 8) {
+      this.addColumnIfMissing('memories', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0');
+      this.db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_memories_is_pinned ON memories(is_pinned)',
+      );
+      this.db.exec('PRAGMA user_version = 8');
+    }
+
+    // ── v9: Conflict resolution — memory_relations table ──
+    if (current < 9) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_relations (
+          id TEXT PRIMARY KEY,
+          memory_id_a TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+          memory_id_b TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+          relation TEXT NOT NULL CHECK (relation IN ('related','compatible','scoped','conflicts_with','supersedes','not_conflict')),
+          confidence REAL,
+          reasoning TEXT,
+          marked_by TEXT,
+          created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_relations_unique ON memory_relations(memory_id_a, memory_id_b, relation);
+        CREATE INDEX IF NOT EXISTS idx_memory_relations_a ON memory_relations(memory_id_a);
+        CREATE INDEX IF NOT EXISTS idx_memory_relations_b ON memory_relations(memory_id_b);
+      `);
+      this.db.exec('PRAGMA user_version = 9');
+    }
   }
 
   /**
@@ -805,6 +1204,48 @@ export class SqliteMemoryStore implements MemoryStore {
     }
   }
 
+  // ── T-013: Multi-DB cross-project search ───────────────────────
+
+  /**
+   * Set sibling stores for cross-project search. When `all_projects=true`
+   * is passed to search(), results are merged from this store AND all siblings.
+   */
+  setSiblingStores(stores: SqliteMemoryStore[]): void {
+    this.siblingStores = stores;
+  }
+
+  /**
+   * Search across this store and all sibling stores, merge by score, apply limit.
+   * Called when `all_projects=true` and siblings exist.
+   */
+  private async searchAllProjects(
+    query: string,
+    mode: SearchMode,
+    filters: SearchFilters,
+  ): Promise<SearchResult[]> {
+    const limit = filters.limit ?? 10;
+    // Disable all_projects on individual searches to prevent recursion
+    const localFilters = { ...filters, all_projects: false };
+
+    // Search this store
+    const localResults = await this.search(query, mode, localFilters);
+
+    // Search sibling stores (each handles its own access tracking)
+    const siblingResults: SearchResult[][] = await Promise.all(
+      this.siblingStores.map(s => s.search(query, mode, localFilters)),
+    );
+
+    // Merge all results
+    const allResults: SearchResult[] = [...localResults];
+    for (const sr of siblingResults) {
+      allResults.push(...sr);
+    }
+
+    // Sort by score descending, apply limit
+    allResults.sort((a, b) => b.score - a.score);
+    return allResults.slice(0, limit);
+  }
+
   // ── Decay state transitions ───────────────────────────────────────
 
   /**
@@ -819,10 +1260,30 @@ export class SqliteMemoryStore implements MemoryStore {
     config?: ForgettingConfig,
   ): DecayTransitionResult {
     const row = this.db.prepare(
-      'SELECT memory_state, last_reinforced_at, created_at FROM memories WHERE id = ?',
-    ).get(memoryId) as { memory_state: string; last_reinforced_at: string | null; created_at: string } | undefined;
+      'SELECT memory_state, last_reinforced_at, created_at, is_pinned, non_forgettable FROM memories WHERE id = ?',
+    ).get(memoryId) as { memory_state: string; last_reinforced_at: string | null; created_at: string; is_pinned: number; non_forgettable: number } | undefined;
 
     if (!row) throw new MemoryNotFoundError(memoryId);
+
+    // Skip pinned memories — they are exempt from decay
+    if (row.is_pinned) {
+      return {
+        newState: (row.memory_state ?? 'active') as DecayState,
+        newScore: evaluateActivationScore((row.memory_state ?? 'active') as DecayState),
+        reason: 'pinned memory is exempt from decay',
+        transitioned: false,
+      };
+    }
+
+    // Skip non_forgettable memories — they are exempt from decay (T-008)
+    if (row.non_forgettable) {
+      return {
+        newState: (row.memory_state ?? 'active') as DecayState,
+        newScore: evaluateActivationScore((row.memory_state ?? 'active') as DecayState),
+        reason: 'non_forgettable memory is exempt from decay',
+        transitioned: false,
+      };
+    }
 
     const currentState = (row.memory_state ?? 'active') as DecayState;
     const lastReinforcedAt = row.last_reinforced_at ?? row.created_at;
@@ -849,6 +1310,13 @@ export class SqliteMemoryStore implements MemoryStore {
       this.db.prepare(
         'UPDATE memories SET memory_state = ?, activation_score = ? WHERE id = ?',
       ).run(result.newState, result.newScore, memoryId);
+
+      // T-008: Auto-flag for review when transitioning to dimmed/shadow/gist_only
+      if (shouldAutoFlagForReview(result.newState, currentState)) {
+        this.db.prepare(
+          `UPDATE memories SET status = 'needs_review', review_reason = ?, reviewed_at = ? WHERE id = ?`,
+        ).run(`decay: ${result.newState}`, new Date().toISOString(), memoryId);
+      }
     }
 
     return result;
@@ -925,7 +1393,7 @@ export class SqliteMemoryStore implements MemoryStore {
 
     const rows = this.db.prepare(
       `SELECT id, memory_state, last_reinforced_at, created_at, activation_score
-       FROM memories WHERE memory_state != 'purged'`,
+       FROM memories WHERE memory_state != 'purged' AND (is_pinned = 0 OR is_pinned IS NULL) AND (non_forgettable = 0 OR non_forgettable IS NULL)`,
     ).all() as Array<{
       id: string;
       memory_state: string;
@@ -969,6 +1437,14 @@ export class SqliteMemoryStore implements MemoryStore {
         // Create gist when transitioning to gist_only (inline within transaction)
         if (result.newState === 'gist_only' && fromState !== 'gist_only') {
           this.createMemoryGist(memoryId);
+        }
+
+        // T-008: Auto-flag for review when transitioning to dimmed/shadow/gist_only.
+        // Pinned and non_forgettable memories are already excluded by the query above.
+        if (shouldAutoFlagForReview(result.newState, fromState)) {
+          this.db.prepare(
+            `UPDATE memories SET status = 'needs_review', review_reason = ?, reviewed_at = ? WHERE id = ?`,
+          ).run(`decay: ${result.newState}`, new Date().toISOString(), memoryId);
         }
       }
       this.db.exec('COMMIT');
@@ -1145,13 +1621,45 @@ export class SqliteMemoryStore implements MemoryStore {
 
   // ── Storage ──────────────────────────────────────────────────────
 
-  async store(request: StoreRequest): Promise<Memory> {
+  async store(request: StoreRequest): Promise<Memory | StoreResult> {
     const now = new Date().toISOString();
     const id = request.id ?? randomUUID();
     const tags = JSON.stringify(request.tags ?? []);
-    const embedding = await this.embedder.embed(request.content);
+    const embedding = await this.embedder.embed(request.content, 'passage');
     const provenance = request.provenance;
     const requestedStatus = request.status; // undefined → leave existing status untouched on conflict
+
+    // ── Collision detection (opt-in) ──
+    // W2 fix: detect collisions BEFORE upsert. When candidates exist, return
+    // { judgment_required: true, candidates } WITHOUT persisting the new memory.
+    // The caller must judge (not_conflict → re-call store) or resolve otherwise.
+    if (request.detect_conflicts) {
+      const threshold = request.conflict_threshold ?? parseFloat(process.env.MEMORY_CONFLICT_THRESHOLD ?? '0.92');
+      const candidates = this.detectCollisions(embedding, threshold, request.content);
+      if (candidates.length > 0) {
+        return { judgment_required: true, candidates };
+      }
+      const stored = await this._doStore(id, request, now, tags, embedding, provenance, requestedStatus);
+      return { stored, judgment_required: false };
+    }
+
+    const stored = await this._doStore(id, request, now, tags, embedding, provenance, requestedStatus);
+    return stored;
+  }
+
+  /**
+   * Internal store implementation — performs the actual INSERT/UPDATE.
+   * Separated from store() so collision detection can run first.
+   */
+  private async _doStore(
+    id: string,
+    request: StoreRequest,
+    now: string,
+    tags: string,
+    embedding: number[],
+    provenance: StoreRequest['provenance'],
+    requestedStatus: StoreRequest['status'],
+  ): Promise<Memory> {
 
     this.db.exec('BEGIN');
     try {
@@ -1228,12 +1736,311 @@ export class SqliteMemoryStore implements MemoryStore {
     return rowToMemory(row);
   }
 
+  // ── Conflict detection (v9) ────────────────────────────────────────
+
+  /**
+   * Detect potential collision candidates for a new memory.
+   *
+   * Runs cosine-similarity query against same-project memories. For each
+   * candidate: if cosine > threshold AND FTS title overlap >= 60%, include
+   * in results. Returns candidates sorted by similarity descending.
+   */
+  private detectCollisions(
+    queryEmbedding: number[],
+    threshold: number,
+    content: string,
+  ): CandidateMemory[] {
+    // Fetch all existing embeddings + metadata
+    const rows = this.db.prepare(
+      `SELECT m.id, m.content, m.created_at, e.embedding
+       FROM memories m
+       JOIN memory_embeddings e ON e.id = m.id
+       WHERE m.status != 'archived'`,
+    ).all() as Array<{
+      id: string;
+      content: string;
+      created_at: string;
+      embedding: Buffer | Uint8Array;
+    }>;
+
+    if (rows.length === 0) return [];
+
+    // Precompute query tokens for FTS overlap check
+    const queryTokens = new Set(
+      content.toLowerCase().split(/\s+/).filter(t => t.length > 2),
+    );
+
+    const candidates: CandidateMemory[] = [];
+
+    for (const row of rows) {
+      const similarity = cosineDistance(queryEmbedding, blobToEmbedding(row.embedding));
+      if (similarity < threshold) continue;
+
+      // FTS title overlap: >= 60% of query tokens must appear in candidate
+      if (queryTokens.size > 0) {
+        const candidateLower = row.content.toLowerCase();
+        let overlap = 0;
+        for (const token of queryTokens) {
+          if (candidateLower.includes(token)) overlap++;
+        }
+        const overlapRatio = overlap / queryTokens.size;
+        if (overlapRatio < 0.6) continue;
+      }
+
+      candidates.push({
+        id: row.id,
+        similarity,
+        content_preview: row.content.slice(0, 200),
+        createdAt: row.created_at,
+      });
+    }
+
+    // Sort by similarity descending
+    candidates.sort((a, b) => b.similarity - a.similarity);
+    return candidates;
+  }
+
+  // ── Memory relations (v9) ──────────────────────────────────────────
+
+  /**
+   * Persist a relation between two memories. Validates the relation enum.
+   * Returns the persisted MemoryRelation.
+   */
+  addMemoryRelation(opts: {
+    memoryIdA: string;
+    memoryIdB: string;
+    relation: RelationType;
+    confidence?: number;
+    reasoning?: string;
+    markedBy?: string;
+  }): MemoryRelation {
+    if (!VALID_RELATIONS.includes(opts.relation)) {
+      throw new Error(
+        `Invalid relation '${opts.relation}': must be one of ${VALID_RELATIONS.join(', ')}`,
+      );
+    }
+
+    const id = randomUUID();
+    const now = new Date().toISOString();
+
+    this.db.prepare(
+      `INSERT INTO memory_relations (id, memory_id_a, memory_id_b, relation, confidence, reasoning, marked_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id, opts.memoryIdA, opts.memoryIdB, opts.relation,
+      opts.confidence ?? null, opts.reasoning ?? null, opts.markedBy ?? null, now,
+    );
+
+    return {
+      id,
+      memoryIdA: opts.memoryIdA,
+      memoryIdB: opts.memoryIdB,
+      relation: opts.relation,
+      ...(opts.confidence !== undefined ? { confidence: opts.confidence } : {}),
+      ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
+      ...(opts.markedBy !== undefined ? { markedBy: opts.markedBy } : {}),
+      createdAt: now,
+    };
+  }
+
+  /**
+   * Get a specific relation between two memories (by ordered pair).
+   * Returns null if no relation exists.
+   */
+  getMemoryRelation(memoryIdA: string, memoryIdB: string): MemoryRelation | null {
+    const row = this.db.prepare(
+      `SELECT id, memory_id_a, memory_id_b, relation, confidence, reasoning, marked_by, created_at
+       FROM memory_relations
+       WHERE memory_id_a = ? AND memory_id_b = ?
+       LIMIT 1`,
+    ).get(memoryIdA, memoryIdB) as {
+      id: string;
+      memory_id_a: string;
+      memory_id_b: string;
+      relation: string;
+      confidence: number | null;
+      reasoning: string | null;
+      marked_by: string | null;
+      created_at: string;
+    } | undefined;
+
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      memoryIdA: row.memory_id_a,
+      memoryIdB: row.memory_id_b,
+      relation: row.relation as RelationType,
+      ...(row.confidence !== null ? { confidence: row.confidence } : {}),
+      ...(row.reasoning !== null ? { reasoning: row.reasoning } : {}),
+      ...(row.marked_by !== null ? { markedBy: row.marked_by } : {}),
+      createdAt: row.created_at,
+    };
+  }
+
+  /**
+   * List all relations involving a memory (either as memory_id_a or memory_id_b).
+   */
+  listMemoryRelations(memoryId: string): MemoryRelation[] {
+    const rows = this.db.prepare(
+      `SELECT id, memory_id_a, memory_id_b, relation, confidence, reasoning, marked_by, created_at
+       FROM memory_relations
+       WHERE memory_id_a = ? OR memory_id_b = ?
+       ORDER BY created_at DESC`,
+    ).all(memoryId, memoryId) as Array<{
+      id: string;
+      memory_id_a: string;
+      memory_id_b: string;
+      relation: string;
+      confidence: number | null;
+      reasoning: string | null;
+      marked_by: string | null;
+      created_at: string;
+    }>;
+
+    return rows.map(row => ({
+      id: row.id,
+      memoryIdA: row.memory_id_a,
+      memoryIdB: row.memory_id_b,
+      relation: row.relation as RelationType,
+      ...(row.confidence !== null ? { confidence: row.confidence } : {}),
+      ...(row.reasoning !== null ? { reasoning: row.reasoning } : {}),
+      ...(row.marked_by !== null ? { markedBy: row.marked_by } : {}),
+      createdAt: row.created_at,
+    }));
+  }
+
+  // ── compare / judge (v9 T-006) ───────────────────────────────────
+
+  /**
+   * Compare two memories semantically.
+   * Returns similarity (cosine), shared entities, content diff summary, and recommendation.
+   */
+  async compare(idA: string, idB: string): Promise<CompareResult> {
+    const memA = this.db.prepare(
+      'SELECT id, content FROM memories WHERE id = ?',
+    ).get(idA) as { id: string; content: string } | undefined;
+    const memB = this.db.prepare(
+      'SELECT id, content FROM memories WHERE id = ?',
+    ).get(idB) as { id: string; content: string } | undefined;
+
+    if (!memA) throw new MemoryNotFoundError(idA);
+    if (!memB) throw new MemoryNotFoundError(idB);
+
+    const embA = this.db.prepare(
+      'SELECT embedding FROM memory_embeddings WHERE id = ?',
+    ).get(idA) as { embedding: Buffer | Uint8Array } | undefined;
+    const embB = this.db.prepare(
+      'SELECT embedding FROM memory_embeddings WHERE id = ?',
+    ).get(idB) as { embedding: Buffer | Uint8Array } | undefined;
+
+    const similarity = (embA && embB)
+      ? cosineDistance(blobToEmbedding(embA.embedding), blobToEmbedding(embB.embedding))
+      : 0;
+
+    const sharedEntities = extractSharedEntities(memA.content, memB.content);
+
+    const lenA = memA.content.length;
+    const lenB = memB.content.length;
+    const contentDiff = lenA > lenB
+      ? `A is ${lenA - lenB} chars longer`
+      : lenB > lenA
+        ? `B is ${lenB - lenA} chars longer`
+        : 'Same length';
+
+    let recommendation: string;
+    if (similarity >= 0.95) {
+      recommendation = 'supersedes: near-duplicate content';
+    } else if (similarity >= 0.85) {
+      recommendation = 'conflicts_with: high similarity with differences';
+    } else if (similarity >= 0.5) {
+      recommendation = 'related: moderate semantic overlap';
+    } else {
+      recommendation = 'not_conflict: low similarity';
+    }
+
+    return { similarity, sharedEntities, contentDiff, recommendation };
+  }
+
+  /**
+   * Judge a candidate pair: persist a relation, optionally cascade.
+   * judgmentId format: "newMemoryId:existingMemoryId"
+   * For supersedes: archives the existing (older) memory.
+   */
+  async judge(judgmentId: string, relation: RelationType, reasoning?: string, confidence?: number): Promise<JudgeResult> {
+    const colonIdx = judgmentId.indexOf(':');
+    if (colonIdx <= 0 || colonIdx === judgmentId.length - 1) {
+      throw new Error(
+        `Invalid judgment_id '${judgmentId}': must be in format 'newId:existingId'`,
+      );
+    }
+
+    if (!VALID_RELATIONS.includes(relation)) {
+      throw new Error(
+        `Invalid relation '${relation}': must be one of ${VALID_RELATIONS.join(', ')}`,
+      );
+    }
+
+    const newId = judgmentId.slice(0, colonIdx);
+    const existingId = judgmentId.slice(colonIdx + 1);
+
+    // Verify both memories exist
+    const newMem = this.db.prepare('SELECT id FROM memories WHERE id = ?').get(newId) as { id: string } | undefined;
+    if (!newMem) throw new MemoryNotFoundError(newId);
+    const existingMem = this.db.prepare('SELECT id FROM memories WHERE id = ?').get(existingId) as { id: string } | undefined;
+    if (!existingMem) throw new MemoryNotFoundError(existingId);
+
+    this.addMemoryRelation({
+      memoryIdA: newId,
+      memoryIdB: existingId,
+      relation,
+      confidence,
+      reasoning,
+      markedBy: 'judge',
+    });
+
+    let cascaded: 'archived' | undefined;
+    if (relation === 'supersedes') {
+      this.updateMemoryStatus(existingId, 'archived', `superseded by ${newId}`);
+      cascaded = 'archived';
+    }
+
+    return { persisted: true, relation, ...(cascaded ? { cascaded } : {}) };
+  }
+
+  // ── Review queue (v9 T-008) ─────────────────────────────────────
+
+  /**
+   * List memories with status='needs_review', ordered by reviewed_at ASC
+   * (oldest review request first). Supports optional project filter and limit.
+   */
+  async listReviewQueue(opts?: { projectId?: string; limit?: number }): Promise<{ count: number; items: Memory[] }> {
+    const limit = opts?.limit ?? 50;
+    const conditions: string[] = ["status = 'needs_review'"];
+    const args: (string | number)[] = [];
+
+    if (opts?.projectId) {
+      // Memories don't have project_id directly — project scope is via DB isolation.
+      // This parameter is reserved for future multi-project unified search.
+      // For now, it's a no-op filter on the memory table.
+    }
+
+    conditions.push('LIMIT ?');
+    args.push(limit);
+
+    const rows = this.db.prepare(
+      `SELECT * FROM memories WHERE ${conditions.join(' AND ')} ORDER BY reviewed_at ASC, created_at ASC`,
+    ).all(...args) as unknown as MemoryRow[];
+
+    return { count: rows.length, items: rows.map(rowToMemory) };
+  }
+
   async storeBatch(memories: StoreRequest[]): Promise<Memory[]> {
     if (memories.length === 0) return [];
 
     // 1. Embed all memories first (async, before transaction)
     const embedded = await Promise.all(
-      memories.map(async m => ({ m, vec: await this.embedder.embed(m.content) }))
+      memories.map(async m => ({ m, vec: await this.embedder.embed(m.content, 'passage') }))
     );
 
     // 2. Write all in one transaction (synchronous db calls)
@@ -1342,6 +2149,12 @@ export class SqliteMemoryStore implements MemoryStore {
     mode: SearchMode = 'hybrid',
     filters: SearchFilters = {},
   ): Promise<SearchResult[]> {
+    // T-013: When all_projects=true and sibling stores are configured,
+    // delegate to searchAllProjects for multi-DB enumeration.
+    if (filters.all_projects && this.siblingStores.length > 0) {
+      return this.searchAllProjects(query, mode, filters);
+    }
+
     const limit = filters.limit ?? 10;
 
     switch (mode) {
@@ -1394,7 +2207,7 @@ export class SqliteMemoryStore implements MemoryStore {
     trackAccess: boolean = true,
     rawScores?: Map<string, number>,
   ): Promise<SearchResult[]> {
-    const queryVec = await this.embedder.embed(query);
+    const queryVec = await this.embedder.embed(query, 'query');
     return this.vectorSearch(queryVec, filters, limit, null, trackAccess, rawScores);
   }
 
@@ -1590,7 +2403,7 @@ export class SqliteMemoryStore implements MemoryStore {
     }
     if (sources.length === 0) return [];
 
-    const queryVec = await this.embedder.embed(q.query);
+    const queryVec = await this.embedder.embed(q.query, 'query');
     const tokens = q.query.toLowerCase().split(/\s+/).filter(Boolean);
 
     // Collect scored candidates per source so balancing can interleave them.
@@ -1821,9 +2634,15 @@ export class SqliteMemoryStore implements MemoryStore {
       .map(r => ({
         memory: rowToMemory(r),
         score: applyDecay(r, scoreFor(r)),
+        _pinned: r.is_pinned ?? 0,
       }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
+      .sort((a, b) => {
+        // Pinned memories always sort first
+        if (a._pinned !== b._pinned) return b._pinned - a._pinned;
+        return b.score - a.score;
+      })
+      .slice(0, limit)
+      .map(({ memory, score }) => ({ memory, score }));
 
     // Track access (best-effort); skip when caller handles it (e.g. hybridSearch)
     if (trackAccess) {
@@ -1907,7 +2726,7 @@ export class SqliteMemoryStore implements MemoryStore {
     const newCategory = updates.category ?? existing.category;
     const newTags = updates.tags ? JSON.stringify(updates.tags) : existing.tags;
     const embedding = updates.content !== undefined
-      ? await this.embedder.embed(newContent)
+      ? await this.embedder.embed(newContent, 'passage')
       : null;
 
     this.db.exec('BEGIN');
@@ -2216,12 +3035,12 @@ export class SqliteMemoryStore implements MemoryStore {
   async storeSessionPrompt(sessionId: string, rawPrompt: string): Promise<SessionPrompt> {
     const id = randomUUID();
     const now = new Date().toISOString();
-    const embedding = await this.embedder.embed(rawPrompt);
+    const embedding = await this.embedder.embed(rawPrompt, 'passage');
 
     this.db.prepare(
       `INSERT INTO session_prompts (id, session_id, raw_prompt, created_at, updated_at, access_count, last_accessed_at, status, embedding)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, sessionId, rawPrompt, now, now, 0, now, 'active', embeddingToBlob(embedding));
+    ).run(id, sessionId, rawPrompt, now, now, 0, now, 'active', embeddingToBlobOrNull(embedding));
 
     return { id, sessionId, rawPrompt, createdAt: now, updatedAt: now, accessCount: 0, lastAccessedAt: now, status: 'active' };
   }
@@ -2237,12 +3056,12 @@ export class SqliteMemoryStore implements MemoryStore {
 
     const id = randomUUID();
     const now = new Date().toISOString();
-    const embedding = await this.embedder.embed(fullResponse);
+    const embedding = await this.embedder.embed(fullResponse, 'passage');
 
     this.db.prepare(
       `INSERT INTO session_responses (id, session_id, prompt_id, full_response, created_at, updated_at, access_count, last_accessed_at, status, embedding)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, sessionId, promptId, fullResponse, now, now, 0, now, 'active', embeddingToBlob(embedding));
+    ).run(id, sessionId, promptId, fullResponse, now, now, 0, now, 'active', embeddingToBlobOrNull(embedding));
 
     return { id, sessionId, promptId, fullResponse, createdAt: now, updatedAt: now, accessCount: 0, lastAccessedAt: now, status: 'active' };
   }
@@ -2266,7 +3085,7 @@ export class SqliteMemoryStore implements MemoryStore {
     const now = new Date().toISOString();
     // Embed from the richest available text for downstream semantic lookups.
     const embedText = params.resultSummary || params.toolName;
-    const embedding = await this.embedder.embed(embedText);
+    const embedding = await this.embedder.embed(embedText, 'passage');
 
     this.db.prepare(
       `INSERT INTO session_tool_calls
@@ -2275,7 +3094,7 @@ export class SqliteMemoryStore implements MemoryStore {
     ).run(
       id, params.sessionId, params.promptId ?? null, params.responseId ?? null,
       params.toolName, params.argsSafe ?? null, params.resultSummary ?? null,
-      params.importance ?? null, now, now, 0, now, 'active', embeddingToBlob(embedding),
+      params.importance ?? null, now, now, 0, now, 'active', embeddingToBlobOrNull(embedding),
     );
 
     const result: SessionToolCall = {
@@ -2311,7 +3130,7 @@ export class SqliteMemoryStore implements MemoryStore {
     const decisions = params.decisions ?? [];
     // Embed from summary + decisions so the summary is retrievable by either signal.
     const embedText = `${params.summary} ${decisions.join(' ')}`.trim();
-    const embedding = await this.embedder.embed(embedText);
+    const embedding = await this.embedder.embed(embedText, 'passage');
 
     this.db.prepare(
       `INSERT INTO session_summaries
@@ -2324,7 +3143,7 @@ export class SqliteMemoryStore implements MemoryStore {
       params.keyTitles ? JSON.stringify(params.keyTitles) : null,
       params.memoryIds ? JSON.stringify(params.memoryIds) : null,
       params.artifactRefs ? JSON.stringify(params.artifactRefs) : null,
-      now, now, 0, now, 'active', embeddingToBlob(embedding),
+      now, now, 0, now, 'active', embeddingToBlobOrNull(embedding),
     );
 
     const result: SessionSummary = {
@@ -2624,6 +3443,38 @@ export class SqliteMemoryStore implements MemoryStore {
     }
 
     return results.slice(0, limit);
+  }
+
+  // ── Pin / Unpin (v8) ───────────────────────────────────────────────
+
+  async pin(id: string): Promise<Memory> {
+    const existing = this.db.prepare(
+      'SELECT id FROM memories WHERE id = ?',
+    ).get(id) as { id: string } | undefined;
+
+    if (!existing) throw new MemoryNotFoundError(id);
+
+    this.db.prepare(
+      'UPDATE memories SET is_pinned = 1 WHERE id = ?',
+    ).run(id);
+
+    const row = this.db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as unknown as MemoryRow;
+    return rowToMemory(row);
+  }
+
+  async unpin(id: string): Promise<Memory> {
+    const existing = this.db.prepare(
+      'SELECT id FROM memories WHERE id = ?',
+    ).get(id) as { id: string } | undefined;
+
+    if (!existing) throw new MemoryNotFoundError(id);
+
+    this.db.prepare(
+      'UPDATE memories SET is_pinned = 0 WHERE id = ?',
+    ).run(id);
+
+    const row = this.db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as unknown as MemoryRow;
+    return rowToMemory(row);
   }
 
   // ── Auto-link helper (T-004 / PR-2) ──────────────────────────────────
